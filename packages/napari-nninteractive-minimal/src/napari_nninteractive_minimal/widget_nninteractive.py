@@ -146,6 +146,7 @@ class nnInteractiveWidgetMinimal(nnInteractiveWidgetBeacon):
         Supported keys:
           backend: "local" or "remote"
           server_url: URL of nninteractive-server
+          ssh_target: optional SSH login or alias for an automatic local tunnel
           local_checkpoint: optional local checkpoint path
 
         API keys deliberately do not come from YAML. If the API-key field is
@@ -170,6 +171,10 @@ class nnInteractiveWidgetMinimal(nnInteractiveWidgetBeacon):
             self.server_url_edit.blockSignals(True)
             self.server_url_edit.setText(str(server_url))
             self.server_url_edit.blockSignals(False)
+
+        ssh_target = config.get("ssh_target")
+        if ssh_target:
+            self.ssh_target_edit.setText(str(ssh_target))
 
         local_checkpoint = config.get("local_checkpoint")
         if local_checkpoint:

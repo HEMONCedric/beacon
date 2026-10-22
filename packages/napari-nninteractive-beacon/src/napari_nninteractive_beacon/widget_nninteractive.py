@@ -4,10 +4,13 @@ from typing import Any
 
 import numpy as np
 from napari.layers.labels._labels_constants import Mode
+from napari.qt.threading import create_worker
 from napari.utils.notifications import show_warning
 from napari_beacon_layers import ManualLabelsLayer
 from napari_nninteractive import nnInteractiveWidget
-from qtpy.QtWidgets import QPushButton
+from qtpy.QtWidgets import QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton
+
+from .ssh_tunnel import DEFAULT_SERVER_URL, SSH_TARGET_SETTING, manager, spec_from_url
 
 
 class nnInteractiveWidgetBeacon(nnInteractiveWidget):
@@ -37,6 +40,7 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         self._saved_ai_control_states: dict[str, bool] = {}
         self._saved_prompt_editability: dict[str, bool] = {}
         self._saved_prompt_modes: dict[str, Any] = {}
+        self._ssh_tunnel_worker = None
 
         super().__init__(napari_viewer, *args, **kwargs)
         from qtpy.QtWidgets import QSizePolicy
@@ -55,6 +59,82 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         self.refine_manual_button.clicked.connect(self.on_refine_manually)
         self._insert_manual_refinement_button()
         self.refine_manual_button.setEnabled(self.session is not None)
+
+    def _init_model_selection(self) -> QGroupBox:
+        group = super()._init_model_selection()
+        if not self.server_url_edit.text().strip():
+            self.server_url_edit.blockSignals(True)
+            self.server_url_edit.setText(DEFAULT_SERVER_URL)
+            self.server_url_edit.blockSignals(False)
+
+        saved = self._settings.value(
+            SSH_TARGET_SETTING,
+            self._settings.value("beacon/nninteractive_ssh_target", "", type=str),
+            type=str,
+        )
+        self.ssh_target_edit = QLineEdit(saved)
+        self.ssh_target_edit.setPlaceholderText("user@host or SSH alias (optional for a local server)")
+        self.ssh_target_edit.setToolTip(
+            "For a localhost URL, open an SSH tunnel automatically before Connect or Initialize. "
+            "Leave blank when the server is already reachable locally. SSH key authentication is required "
+            "for automatic tunnels; the server API key is independent and optional."
+        )
+        self.ssh_target_edit.textChanged.connect(
+            lambda value: self._settings.setValue(SSH_TARGET_SETTING, value)
+        )
+        self.ssh_target_edit.textChanged.connect(self.on_remote_settings_changed)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("SSH target"))
+        row.addWidget(self.ssh_target_edit, 1)
+        self.remote_container.layout().insertLayout(1, row)
+        return group
+
+    def _set_connecting(self, connecting: bool) -> None:
+        super()._set_connecting(connecting)
+        ssh_edit = getattr(self, "ssh_target_edit", None)
+        if ssh_edit is not None:
+            ssh_edit.setEnabled(not connecting)
+
+    def _start_claim(self, on_connected=None) -> None:
+        """Open a localhost tunnel in a worker, then claim the remote session."""
+
+        if self._ssh_tunnel_worker is not None:
+            return
+        try:
+            spec = spec_from_url(self.server_url_edit.text())
+        except ValueError as exc:
+            self.remote_status_label.setText(f"Invalid server URL: {exc}")
+            return
+        if spec is None:
+            super()._start_claim(on_connected=on_connected)
+            return
+
+        self._set_connecting(True)
+        self.connect_btn.setText("Opening SSH...")
+        self.remote_status_label.setText("Opening SSH tunnel...")
+        worker = create_worker(
+            manager().ensure,
+            spec,
+            self.ssh_target_edit.text().strip(),
+            _connect={
+                "returned": lambda _status: self._on_ssh_tunnel_ready(on_connected),
+                "errored": lambda error: self._on_ssh_tunnel_error(error),
+            },
+            _start_thread=False,
+            _ignore_errors=True,
+        )
+        self._ssh_tunnel_worker = worker
+        worker.finished.connect(lambda: setattr(self, "_ssh_tunnel_worker", None))
+        worker.start()
+
+    def _on_ssh_tunnel_ready(self, on_connected=None) -> None:
+        super()._start_claim(on_connected=on_connected)
+
+    def _on_ssh_tunnel_error(self, error: BaseException) -> None:
+        self._set_connecting(False)
+        self.connect_btn.setText("Connect")
+        self.remote_status_label.setText(f"SSH tunnel failed: {error}")
+        show_warning(f"Could not open nnInteractive SSH tunnel: {error}")
 
     def _insert_manual_refinement_button(self) -> None:
         layout = self.reset_button.parentWidget().layout()

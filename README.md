@@ -56,6 +56,10 @@ The repository also contains some utility plugins:
 
 ---
 
+The [BEACON DICOM reader](./packages/napari-beacon-dicom/) loads a whole DICOM
+image series as a geometry-aware 3D volume, even when one `.dcm` file is
+dropped into napari.
+
 ## Table of contents
 
 - [Installation](#installation)
@@ -86,6 +90,12 @@ uv run startup.py
 # alternatively start napari
 uv run napari
 ```
+
+On Windows, the `startup*.py` launchers configure Qt and VisPy to use the same
+software OpenGL library before napari starts. This avoids an OpenGL-context
+failure seen with some graphics drivers; set `QT_OPENGL=desktop` before launch
+to opt out. Other operating systems are unaffected. Plain `uv run napari`
+does not apply this launcher-specific workaround.
 <details>
   <summary>Alternatively using `pip` and `venv`</summary>
 
@@ -114,13 +124,24 @@ docker run --rm --gpus all \
   ghcr.io/mic-dkfz/nninteractive-server:latest
 ```
 
-From the local workstation, create an SSH tunnel:
+In BEACON, select **Remote**, use `http://127.0.0.1:1527` as the server URL,
+and enter `USER@GPU_SERVER` (or an SSH config alias) in **SSH target**. Connect
+or Initialize opens the localhost-only tunnel automatically. This requires
+working non-interactive SSH authentication, but **not** a server API key unless
+the nnInteractive server itself requires one. Leave the API-key field empty
+for a server without API-key authentication. If a server already listens on the
+local port, BEACON uses it without opening SSH. A direct non-local server URL
+also bypasses the tunnel. Tunnels BEACON opened are closed when it exits.
+
+Alternatively, create the tunnel manually from the workstation:
 
 ```bash
 ssh -N -L 1527:127.0.0.1:1527 USER@GPU_SERVER
 ```
 
-Then, in the nnInteractive settings in BEACON, select **Remote**, use `http://127.0.0.1:1527` as the server URL, enter the same API key, and connect/initialize as usual. The image and prompts are sent to the server, while the segmentation is displayed and edited locally in napari. On a trusted network, the server can also be accessed directly without the SSH tunnel.
+Enter the same API key in BEACON only if the server was started with one. The
+image and prompts are sent to the server, while the segmentation is displayed
+and edited locally in napari.
 
 ### In napari
 
