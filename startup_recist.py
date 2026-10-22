@@ -1,3 +1,7 @@
+from patches.windows_opengl import configure_windows_opengl
+
+configure_windows_opengl()
+
 import napari
 from napari import Viewer
 from napari_beacon_dicom import configure_dicom_reader_preference
