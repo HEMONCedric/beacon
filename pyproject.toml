@@ -17,6 +17,7 @@ dependencies = [
     "napari-nninteractive-minimal",
     "napari-nninteractive-beacon",
     "napari-segmentation-metrics",
+    "napari-beacon-dicom",
     "artist_study_app",
     "artist_standalone_app",
     "recist_study_app",
@@ -32,6 +33,7 @@ napari-promptable = { workspace = true }
 napari-promptable-sam2 = { workspace = true }
 napari-shape-based-interpolation = { workspace = true }
 napari-segmentation-metrics = { workspace = true }
+napari-beacon-dicom = { workspace = true }
 napari-shifted-labels = { workspace = true }
 napari-edit-log = { workspace = true }
 napari-quick-view = { workspace = true }

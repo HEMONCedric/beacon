@@ -4,6 +4,7 @@ import glob
 import random
 import time
 from itertools import product
+from pathlib import Path
 
 import numpy as np
 from yaml import safe_load
@@ -21,11 +22,23 @@ from napari_toolkit.widgets import setup_iconbutton, setup_label
 from qtpy.QtWidgets import QVBoxLayout, QWidget, QMessageBox
 
 import SimpleITK as sitk
+from napari_beacon_dicom import read_dicom_image
 from napari_beacon_layers import FixedImageLayer, PreviewLabelsLayer, PreviewPointsLayer, LinePromptLayer
 from napari_inverted_scrolling import invert_scrolling, reset_scrolling, is_inverted
 
 from .acknowledgements import setup_acknowledgements
 from ._napari_ui import modify_napari_ui as _modify_napari_ui, revert_napari_ui as _revert_napari_ui
+
+
+_DICOM_SUFFIXES = {".dcm", ".dicom", ".ima"}
+
+
+def _read_medical_image(path):
+    """Read a regular volume or expand one DICOM instance to its full series."""
+    candidate = Path(path).expanduser()
+    if candidate.is_dir() or candidate.suffix.lower() in _DICOM_SUFFIXES:
+        return read_dicom_image(candidate)
+    return sitk.ReadImage(str(candidate))
 
 
 def _resample_sitk_to_isotropic(sitk_image, interpolator=sitk.sitkLinear):
@@ -265,7 +278,7 @@ class StudyAppFullWidget(QWidget):
 
         isotropic_pixels = self.study_protocol.get("isotropic_pixels", False)
 
-        img_sitk = sitk.ReadImage(path)
+        img_sitk = _read_medical_image(path)
         # keep a reference to the original, non-resampled image so line prompt
         # coordinates can also be reported in the original image's index space
         self._original_img_sitk_reference = img_sitk

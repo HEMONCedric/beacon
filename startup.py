@@ -1,6 +1,9 @@
 from patches.nninteractive_windows_fix import apply_nninteractive_windows_fix
 apply_nninteractive_windows_fix()
 
+from napari_beacon_dicom import configure_dicom_reader_preference
+configure_dicom_reader_preference()
+
 import napari
 from napari import Viewer
 

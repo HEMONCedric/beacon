@@ -56,7 +56,7 @@ class StandaloneSetupDialog(QDialog):
         self._image_select = setup_fileselect(
             layout,
             "Image file",
-            filtering="Medical images (*.mha *.mhd *.nii *.nii.gz *.nrrd);;All files (*)",
+            filtering="Medical images (*.mha *.mhd *.nii *.nii.gz *.nrrd *.dcm *.dicom *.ima);;All files (*)",
         )
 
         # --- Method ---

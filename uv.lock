@@ -13,6 +13,7 @@ members = [
     "artist-standalone-app",
     "artist-study-app",
     "napari-beacon",
+    "napari-beacon-dicom",
     "napari-beacon-layers",
     "napari-edit-log",
     "napari-inverted-scrolling",
@@ -247,6 +248,7 @@ name = "artist-study-app"
 version = "0.1.0"
 source = { editable = "apps/artist_study_app" }
 dependencies = [
+    { name = "napari-beacon-dicom" },
     { name = "napari-beacon-layers" },
     { name = "napari-inverted-scrolling" },
     { name = "napari-nninteractive-minimal" },
@@ -257,6 +259,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "napari-beacon-dicom", editable = "packages/napari-beacon-dicom" },
     { name = "napari-beacon-layers", editable = "packages/napari-beacon-layers" },
     { name = "napari-inverted-scrolling", editable = "packages/napari-inverted-scrolling" },
     { name = "napari-nninteractive-minimal", editable = "packages/napari-nninteractive-minimal" },
@@ -1720,6 +1723,7 @@ dependencies = [
     { name = "artist-standalone-app" },
     { name = "artist-study-app" },
     { name = "napari", extra = ["optional", "pyqt6"] },
+    { name = "napari-beacon-dicom" },
     { name = "napari-beacon-layers" },
     { name = "napari-edit-log" },
     { name = "napari-inverted-scrolling" },
@@ -1747,6 +1751,7 @@ requires-dist = [
     { name = "artist-study-app", editable = "apps/artist_study_app" },
     { name = "napari", specifier = "==0.6.6" },
     { name = "napari", extras = ["pyqt6", "optional"] },
+    { name = "napari-beacon-dicom", editable = "packages/napari-beacon-dicom" },
     { name = "napari-beacon-layers", editable = "packages/napari-beacon-layers" },
     { name = "napari-edit-log", editable = "packages/napari-edit-log" },
     { name = "napari-inverted-scrolling", editable = "packages/napari-inverted-scrolling" },
@@ -1765,6 +1770,25 @@ requires-dist = [
     { name = "opencv-python-headless" },
     { name = "recist-standalone-app", editable = "apps/recist_standalone_app" },
     { name = "recist-study-app", editable = "apps/recist_study_app" },
+    { name = "simpleitk" },
+]
+
+[[package]]
+name = "napari-beacon-dicom"
+version = "0.1.0"
+source = { editable = "packages/napari-beacon-dicom" }
+dependencies = [
+    { name = "napari" },
+    { name = "numpy" },
+    { name = "qtpy" },
+    { name = "simpleitk" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "napari", specifier = ">=0.6.0" },
+    { name = "numpy" },
+    { name = "qtpy" },
     { name = "simpleitk" },
 ]
 
@@ -3347,6 +3371,7 @@ name = "recist-study-app"
 version = "0.1.0"
 source = { editable = "apps/recist_study_app" }
 dependencies = [
+    { name = "napari-beacon-dicom" },
     { name = "napari-beacon-layers" },
     { name = "napari-inverted-scrolling" },
     { name = "napari-toolkit" },
@@ -3356,6 +3381,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "napari-beacon-dicom", editable = "packages/napari-beacon-dicom" },
     { name = "napari-beacon-layers", editable = "packages/napari-beacon-layers" },
     { name = "napari-inverted-scrolling", editable = "packages/napari-inverted-scrolling" },
     { name = "napari-toolkit" },

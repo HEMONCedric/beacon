@@ -44,6 +44,7 @@ from qtpy.QtCore import Qt  # type: ignore[attr-defined]
 import glob
 
 import SimpleITK as sitk
+from napari_beacon_dicom import read_dicom_image
 from napari_beacon_layers import FixedImageLayer, PreviewLabelsLayer, ManualLabelsLayer, PreviewPointsLayer
 from napari_manual_segmentation import ManualSegmentationWidget
 from napari_manual_segmentation.utils.utils import ColorMapper, determine_layer_index
@@ -55,6 +56,17 @@ from napari_inverted_scrolling import invert_scrolling, reset_scrolling, is_inve
 from .acknowledgements import setup_acknowledgements
 from .segmentation_metrics_preview import SegmentationMetricsWidget
 from ._napari_ui import modify_napari_ui as _modify_napari_ui, revert_napari_ui as _revert_napari_ui
+
+_DICOM_SUFFIXES = {".dcm", ".dicom", ".ima"}
+
+
+def _read_medical_image(path):
+    """Read a regular volume or expand one DICOM instance to its full series."""
+    candidate = Path(path).expanduser()
+    if candidate.is_dir() or candidate.suffix.lower() in _DICOM_SUFFIXES:
+        return read_dicom_image(candidate)
+    return sitk.ReadImage(str(candidate))
+
 
 def _resample_segmentation_to_original_space(seg_sitk, reference_sitk):
     resampler = sitk.ResampleImageFilter()
@@ -357,7 +369,7 @@ class StudyAppFullWidget(QWidget):
         interpolation_method = interpolation_methods_map.get(self.study_protocol.get("interpolation", "nearest"), sitk.sitkNearestNeighbor)
             
         self._original_img_sitk_reference = None
-        img_sitk = sitk.ReadImage(path)
+        img_sitk = _read_medical_image(path)
         if isotropic_pixels:
             self._original_img_sitk_reference = img_sitk
         if isotropic_pixels:

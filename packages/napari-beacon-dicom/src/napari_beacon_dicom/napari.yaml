@@ -1,0 +1,28 @@
+name: napari-beacon-dicom
+display_name: BEACON DICOM
+visibility: hidden
+categories:
+  - Image Processing
+  - Utilities
+
+contributions:
+  commands:
+    - id: napari-beacon-dicom.read
+      title: Read DICOM image series
+      python_name: napari_beacon_dicom.reader:get_reader
+    - id: napari-beacon-dicom.make_widget
+      title: Open DICOM series
+      python_name: napari_beacon_dicom:DicomSeriesWidget
+  readers:
+    - command: napari-beacon-dicom.read
+      filename_patterns:
+        - "*.dcm"
+        - "*.DCM"
+        - "*.dicom"
+        - "*.DICOM"
+        - "*.ima"
+        - "*.IMA"
+      accepts_directories: true
+  widgets:
+    - command: napari-beacon-dicom.make_widget
+      display_name: Open DICOM series

@@ -1,0 +1,29 @@
+[project]
+name = "napari-beacon-dicom"
+version = "0.1.0"
+description = "Geometry-aware DICOM series reader for BEACON"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "napari>=0.6.0",
+    "numpy",
+    "qtpy",
+    "SimpleITK",
+]
+
+[project.entry-points."napari.manifest"]
+napari-beacon-dicom = "napari_beacon_dicom:napari.yaml"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml"]

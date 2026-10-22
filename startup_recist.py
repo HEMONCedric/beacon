@@ -1,5 +1,8 @@
 import napari
 from napari import Viewer
+from napari_beacon_dicom import configure_dicom_reader_preference
+
+configure_dicom_reader_preference()
 
 viewer = Viewer()
 
