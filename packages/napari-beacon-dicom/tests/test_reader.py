@@ -88,6 +88,7 @@ class DicomReaderTests(unittest.TestCase):
             "napari-beacon-dicom",
         )
         self.assertEqual(settings.plugins.extension2reader["*.tif"], "napari")
+        self.assertEqual(settings.plugins.extension2reader["*.nii.gz"], "napari-beacon-dicom")
 
     def test_discovers_and_reads_geometry_without_patient_tags(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

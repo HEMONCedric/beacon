@@ -24,3 +24,27 @@ The layer is displayed in the acquisition's native stack orientation. This
 avoids napari 0.6 treating sagittal or coronal acquisitions as thin oblique
 reformats. Full patient-space spacing, origin, and direction remain attached as
 DICOM metadata for downstream mask export or analysis.
+
+## NIfTI and exported masks
+
+The same reader also opens scalar 3D `.nii`, `.nii.gz`, `.mha`, `.mhd`, and
+`.nrrd` files. It restores voxel spacing instead of relying on a generic image
+reader returning only a pixel array. These volumes use the same native-axis,
+local-origin display convention as DICOM; complete patient-space geometry is
+retained in `beacon_volume` metadata.
+
+Matching masks inherit the display transform of an open DICOM or medical image.
+The three-plane widget also provides its original-grid display transform, so
+reimport aligns with the 1 mm working image even when the source used different
+viewer units or axis flips. Conflicting reference placements are not guessed.
+
+New BEACON exports carry a segmentation marker and reopen as Labels. Older
+unmarked binary files named `segmentation`, `mask`, `seg`, or `labels` also open
+as Labels. Other unmarked files remain images; File > Open Labels can be used
+to request a labels layer explicitly.
+
+BEACON startup configures this reader as the default for these medical formats.
+Its format-specific rules precede legacy generic rules such as `*.gz`, which
+napari 0.6 otherwise treats as equally specific to `*.nii.gz`. Other compressed
+formats retain their existing reader preference.
+The NIfTI itself retains its original patient-space header for use outside napari.

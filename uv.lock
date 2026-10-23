@@ -1919,18 +1919,22 @@ name = "napari-nninteractive-beacon"
 version = "0.1.0"
 source = { editable = "packages/napari-nninteractive-beacon" }
 dependencies = [
+    { name = "napari-beacon-dicom" },
     { name = "napari-beacon-layers" },
     { name = "napari-nninteractive", extra = ["local"] },
     { name = "numpy" },
     { name = "qtpy" },
+    { name = "simpleitk" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "napari-beacon-dicom", editable = "packages/napari-beacon-dicom" },
     { name = "napari-beacon-layers", editable = "packages/napari-beacon-layers" },
     { name = "napari-nninteractive", extras = ["local"], specifier = "==2.5.3" },
     { name = "numpy" },
     { name = "qtpy" },
+    { name = "simpleitk" },
 ]
 
 [[package]]

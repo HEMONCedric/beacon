@@ -8,7 +8,7 @@ categories:
 contributions:
   commands:
     - id: napari-beacon-dicom.read
-      title: Read DICOM image series
+      title: Read DICOM series and medical volumes
       python_name: napari_beacon_dicom.reader:get_reader
     - id: napari-beacon-dicom.make_widget
       title: Open DICOM series
@@ -22,6 +22,11 @@ contributions:
         - "*.DICOM"
         - "*.ima"
         - "*.IMA"
+        - "*.nii"
+        - "*.nii.gz"
+        - "*.mha"
+        - "*.mhd"
+        - "*.nrrd"
       accepts_directories: true
   widgets:
     - command: napari-beacon-dicom.make_widget

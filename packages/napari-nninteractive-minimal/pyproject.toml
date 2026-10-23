@@ -32,9 +32,6 @@ dependencies = [
     "napari-nninteractive[local]==2.5.3",
 ]
 
-[project.entry-points."napari.manifest"]
-napari-nninteractive-minimal = "napari_nninteractive_minimal:napari.yaml"
-
 [build-system]
 requires = ["uv_build>=0.9.18,<0.10.0"]
 build-backend = "uv_build"

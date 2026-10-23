@@ -10,6 +10,9 @@ configure_dicom_reader_preference()
 
 viewer = Viewer()
 
+from patches.image_interpolation import install_image_interpolation_default
+install_image_interpolation_default(viewer)
+
 from recist_study_app import StudyAppWidget
 widget = StudyAppWidget(viewer)
 viewer.window.add_dock_widget(

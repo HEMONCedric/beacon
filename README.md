@@ -32,6 +32,10 @@ Two groups of plugins were developed for AI-based segmentation: one based on the
 
 ### For 3D segmentation 
 
+- [**napari-nninteractive-beacon**](./packages/napari-nninteractive-beacon/) provides **BEACON Classic** and **BEACON 3-plane Lasso**. The latter uses one lasso in each anatomical plane, a 1 mm isotropic working image, local or remote nnInteractive inference, manual refinement and export on the original image grid.
+
+The Minimal widget described below is now retained only for internal ARTIST study compatibility; it is no longer listed as a standalone plugin.
+
 - [**napari-nninteractive-minimal**](./packages/napari-nninteractive-minimal/) — a simplified version of the excellent [napari-nninteractive](https://github.com/MIC-DKFZ/napari-nninteractive) plugin for interactive segmentation using nnInteractive. This plugin removes some of the more advanced features of the original plugin to provide a more streamlined experience for non-technical users. It also prevents users from accidentally breaking out of the intended workflow, for example by accidentally loading a different image or modifying the napari viewer in a way that breaks the plugin.
 
 - [**napari-manual-segmentation**](./packages/napari-manual-segmentation/) — a plugin for manual segmentation, with a workflow and UI aligned to the simplified napari-nninteractive-minimal plugin.

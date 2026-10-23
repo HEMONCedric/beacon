@@ -4,11 +4,6 @@ display_name: nnInteractive Minimal
 visibility: hidden
 # see https://napari.org/stable/plugins/manifest.html for valid categories
 categories: ["Annotation", "Segmentation", "Acquisition"]
-contributions:
-  commands:
-    - id:  napari-nninteractive-minimal.nnInteractiveWidgetMinimal
-      python_name: napari_nninteractive_minimal:nnInteractiveWidgetMinimal
-      title: nnInteractive (Minimal)
-  widgets:
-    - command: napari-nninteractive-minimal.nnInteractiveWidgetMinimal
-      display_name: nnInteractive (Minimal)
+# Retained only as an internal compatibility component for ARTIST studies.
+# It no longer contributes a standalone plugin to napari's menu.
+contributions: {}

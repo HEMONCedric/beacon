@@ -13,6 +13,9 @@ from napari import Viewer
 
 viewer = Viewer()
 
+from patches.image_interpolation import install_image_interpolation_default
+install_image_interpolation_default(viewer)
+
 from artist_study_app import StudyAppWidget
 widget = StudyAppWidget(viewer)
 viewer.window.add_dock_widget(

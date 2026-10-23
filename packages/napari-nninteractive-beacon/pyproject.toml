@@ -6,8 +6,10 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "napari-nninteractive[local]==2.5.3",
     "napari-beacon-layers",
+    "napari-beacon-dicom",
     "numpy",
     "qtpy",
+    "SimpleITK",
 ]
 
 [project.entry-points."napari.manifest"]

@@ -332,13 +332,17 @@ def get_reader(path: PathOrPaths):
         candidate = _normalise_path(path)
     except ValueError:
         return None
+    from .volume_reader import VOLUME_SUFFIXES, read_medical_volume
+
+    if str(candidate).lower().endswith(VOLUME_SUFFIXES):
+        return read_medical_volume
     if candidate.is_dir() or candidate.suffix.lower() in _DICOM_SUFFIXES:
         return read_dicom
     return None
 
 
 def configure_dicom_reader_preference(settings=None) -> None:
-    """Make the series-aware reader win over napari's generic DICOM reader.
+    """Prefer BEACON's geometry-aware DICOM and medical-volume readers.
 
     Napari's built-in image reader also advertises ``*.dcm``. Without an
     explicit preference, drag-and-drop can therefore open individual 2D
@@ -349,11 +353,24 @@ def configure_dicom_reader_preference(settings=None) -> None:
         from napari.settings import get_settings
 
         settings = get_settings()
-    preferences = dict(settings.plugins.extension2reader)
-    preferences.update(
-        {pattern: _PLUGIN_NAME for pattern in _DICOM_READER_PATTERNS}
-    )
-    settings.plugins.extension2reader = preferences
+    from .volume_reader import VOLUME_SUFFIXES
+
+    preferences = {
+        pattern: _PLUGIN_NAME
+        for pattern in (*_DICOM_READER_PATTERNS, *(f"*{suffix}" for suffix in VOLUME_SUFFIXES))
+    }
+    # napari 0.6 gives '*.gz' and '*.nii.gz' the same specificity score.
+    # Ties follow insertion order, so appending our rules leaves an existing
+    # '*.gz -> napari-nifti' rule in charge of NIfTI imports. Put our rules
+    # first, retaining unrelated rules (including '*.gz' for other formats).
+    settings.plugins.extension2reader = {
+        **preferences,
+        **{
+            pattern: reader
+            for pattern, reader in settings.plugins.extension2reader.items()
+            if pattern not in preferences
+        },
+    }
 
 
 __all__ = [
