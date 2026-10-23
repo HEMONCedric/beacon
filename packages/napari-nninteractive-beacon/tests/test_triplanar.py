@@ -260,29 +260,29 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(layer.selected_data)
         self.assertEqual(self.viewer.dims.not_displayed, (1,))
 
-    def test_reference_traces_are_bright_red_and_do_not_thicken_inference_prompts(self):
+    def test_reference_traces_are_bright_red_and_single_slice(self):
         self.initialize(remote=False)
         overlay = self.widget._prompt_layer
         np.testing.assert_allclose(overlay.colormap.map(np.array([0, 1])),
                                    [[0, 0, 0, 0], [1, 0.12, 0.12, 1]])
         self.assertAlmostEqual(overlay.opacity, 0.65)
+        expected = np.zeros_like(overlay.data)
         for axis in range(3):
             self.draw(axis)
             prompt = self.widget._prompts[axis]
             lo, hi = prompt.bbox[axis]
             self.assertEqual(hi - lo, 1)
             self.assertEqual(prompt.crop.shape[axis], 1)
-            for index in (lo - 1, lo, lo + 1):
-                slices = [slice(a, b) for a, b in prompt.bbox]
-                slices[axis] = slice(index, index + 1)
-                self.assertTrue(np.all(overlay.data[tuple(slices)][prompt.crop.astype(bool)]))
+            slices = tuple(slice(a, b) for a, b in prompt.bbox)
+            expected[slices] |= prompt.crop
+            np.testing.assert_array_equal(overlay.data, expected)
         prompts = [prompt.crop.copy() for prompt in self.widget._prompts.values()]
         self.widget._generate()
         wait_worker(self.widget, "_task_worker")
         for call, original in zip(self.session.calls, prompts, strict=True):
             np.testing.assert_array_equal(call[0], original)
 
-    def test_reference_trace_thickening_clips_at_both_volume_edges(self):
+    def test_reference_traces_stay_single_slice_at_both_volume_edges(self):
         self.initialize(remote=False)
         shape = self.widget._prepared.data.shape
         for axis in range(3):
@@ -293,8 +293,11 @@ class WorkflowTests(unittest.TestCase):
                 self.widget._prompts.clear()
                 self.widget._prompts[axis] = LassoPrompt(axis, crop, bbox)
                 self.widget._refresh_prompt_masks()
-                self.assertEqual(np.count_nonzero(self.widget._prompt_layer.data), 8)
+                self.assertEqual(np.count_nonzero(self.widget._prompt_layer.data), 4)
                 self.assertEqual(np.count_nonzero(crop), 4)
+                self.assertEqual(np.count_nonzero(np.take(self.widget._prompt_layer.data, index, axis=axis)), 4)
+                adjacent = 1 if index == 0 else index - 1
+                self.assertFalse(np.any(np.take(self.widget._prompt_layer.data, adjacent, axis=axis)))
                 opposite = -1 if index == 0 else 0
                 self.assertFalse(np.any(np.take(self.widget._prompt_layer.data, opposite, axis=axis)))
 

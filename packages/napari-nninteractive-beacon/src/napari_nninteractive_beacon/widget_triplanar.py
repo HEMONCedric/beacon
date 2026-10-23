@@ -488,13 +488,10 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
         else:
             data.fill(0)
         for prompt in self._prompts.values():
-            slices = [slice(lo, hi) for lo, hi in prompt.bbox]
-            lo, hi = prompt.bbox[prompt.axis]
-            # Display-only, symmetric thickening of the trace seen from the
-            # other planes. Keep the in-plane lasso footprint and the actual
-            # single-slice prompt sent to nnInteractive unchanged.
-            slices[prompt.axis] = slice(max(0, lo - 1), min(data.shape[prompt.axis], hi + 1))
-            data[tuple(slices)] |= prompt.crop.astype(np.uint8)
+            # Retain the bright red styling, but display the actual single
+            # slice without expanding its trace into neighbouring slices.
+            slices = tuple(slice(lo, hi) for lo, hi in prompt.bbox)
+            data[slices] |= prompt.crop.astype(np.uint8)
         self._prompt_layer.visible = not self._generated
         self._prompt_layer.refresh()
 

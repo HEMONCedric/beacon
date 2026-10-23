@@ -25,9 +25,9 @@ The package contributes two widgets: **nnInteractive (BEACON Classic)** and
 4. Draw one closed positive lasso around the same lesion in **Axial**,
    **Coronal** and **Sagittal**. The plugin advances to the next missing plane.
    Redrawing a plane replaces its mask; the other two remain available.
-   Previously drawn masks appear in bright red. Their traces are thickened
-   symmetrically by one working voxel on either side for display only; inference
-   still receives the original single-slice masks with unchanged footprints.
+   Previously drawn masks appear in bright red with thin, single-slice traces
+   in the other planes. Display does not expand the masks into neighbouring
+   slices; inference receives the original masks with unchanged footprints.
 5. Click **Generate segmentation**. All three cropped 2D masks are accumulated
    before the single prediction. The controls are locked while it runs.
 6. **Undo** returns from the prediction to the three lassos. Before prediction,
