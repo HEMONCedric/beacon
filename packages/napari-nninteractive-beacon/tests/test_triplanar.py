@@ -23,6 +23,7 @@ class FakeSession:
     supported_interactions = {"lasso": True, "points": True, "bbox2d": True, "scribble": True}
     preferred_scribble_thickness = (1, 1, 1)
     license = "test"
+    supports_initial_label = True
 
     def __init__(self):
         self.calls = []
@@ -40,6 +41,13 @@ class FakeSession:
 
     def reset_interactions(self):
         self.calls.clear()
+        if self.target is not None:
+            self.target.fill(0)
+
+    def add_initial_seg_interaction(self, mask, run_prediction=False):
+        self.seed = mask.copy()
+        self.calls.clear()
+        self.target[:] = mask
 
     def add_lasso_interaction(self, mask, positive, run_prediction=True, interaction_bbox=None):
         self.calls.append((mask.copy(), positive, run_prediction, interaction_bbox))
@@ -360,6 +368,38 @@ class WorkflowTests(unittest.TestCase):
         for name in (self.widget.point_layer_name, self.widget.bbox_layer_name, self.widget.scribble_layer_name):
             self.assertNotIn(name, self.viewer.layers)
 
+    def test_native_remote_upload_updates_progress_and_preserves_the_three_lassos(self):
+        from napari_nninteractive_beacon.native_grid import resample_native, sample_values
+        from nnInteractive.inference.remote.serialization import unpack_array
+
+        self.initialize(remote=True)
+        self.session._get_json = lambda path: {"protocol_version": 1}
+        self.session._set_image_timeout = 30
+        def post(path, meta, payload, timeout=None):
+            native = unpack_array(payload)
+            np.testing.assert_array_equal(native[0], self.volume.source_data)
+            working = resample_native(native, meta["source_grid"], meta["target_grid"])
+            self.session.set_image(working, {"spacing": [1, 1, 1]})
+            info = {"protocol_version": 1, "working_grid": meta["target_grid"],
+                    "original_image_shape": list(working.shape),
+                    "sample_values": sample_values(working), "timings": {"resample_s": .01}}
+            return SimpleNamespace(json=lambda: info)
+        self.session._post_binary = post
+        self.widget.on_init()
+        wait_worker(self.widget, "_worker")
+        self.assertTrue(self.widget._session_ready)
+        self.assertEqual(self.widget._last_upload_report["mode"], "native")
+        self.assertIn("Original image sent", self.widget.task_status.text())
+        np.testing.assert_array_equal(self.session.image[0], self.volume.data)
+        for axis in range(3):
+            self.draw(axis)
+        self.widget._generate()
+        wait_worker(self.widget, "_task_worker")
+        self.assertTrue(self.widget._generated)
+        for call, prompt in zip(self.session.calls, self.widget._prompts.values(), strict=True):
+            np.testing.assert_array_equal(call[0], prompt.crop)
+            self.assertEqual(call[3], prompt.bbox)
+
     def test_new_image_reuses_layers_with_new_geometry(self):
         self.initialize(remote=True)
         for axis in range(3):
@@ -386,6 +426,144 @@ class WorkflowTests(unittest.TestCase):
         self.widget._generate()
         wait_worker(self.widget, "_task_worker")
         self.assertTrue(self.widget._generated)
+
+    def generate(self):
+        for axis in range(3):
+            self.draw(axis)
+        self.widget._generate()
+        wait_worker(self.widget, "_task_worker")
+
+    def test_dilate_and_undo_preserve_geometry_and_work_without_server(self):
+        self.initialize(remote=True)
+        self.generate()
+        layer = self.widget._result_layer()
+        layer.data.fill(0)
+        centre = tuple(n // 2 for n in layer.data.shape)
+        layer.data[centre] = 1
+        original = layer.data.copy()
+        matrix = layer._data_to_world.affine_matrix.copy()
+        # Dilation is a local postprocessing operation, even in remote mode.
+        self.widget._session_ready = False
+        self.widget._dilate()
+        self.assertFalse(self.widget.dilate_button.isEnabled())
+        wait_worker(self.widget, "_task_worker")
+        self.assertEqual(np.count_nonzero(layer.data), 33)
+        np.testing.assert_allclose(layer._data_to_world.affine_matrix, matrix)
+        self.assertTrue(self.widget._generated)
+        self.widget.on_undo()
+        np.testing.assert_array_equal(layer.data, original)
+        self.assertTrue(self.widget._generated)
+        self.assertTrue(self.widget.export_button.isEnabled())
+
+    def test_additional_lassos_in_any_plane_are_accumulated_and_undoable(self):
+        for remote in (False, True):
+            self.initialize(remote=remote)
+            self.generate()
+            original_prompts = list(self.widget._prompts.values())
+            original = self.widget._result_layer().data.copy()
+            for index, axis in enumerate((0, 0, 1, 2)):
+                self.widget.add_lasso_button.click()
+                self.assertTrue(self.widget._adding_lasso)
+                self.assertTrue(all(button.isEnabled() for button in self.widget.plane_buttons))
+                self.assertFalse(self.widget.refine_manual_button.isEnabled())
+                self.draw(axis)
+                wait_worker(self.widget, "_task_worker")
+                self.assertFalse(self.widget._adding_lasso)
+                self.assertEqual(len(self.widget._extra_prompts), index + 1)
+                self.assertEqual(len(self.session.calls), 4 + index)
+                self.assertEqual([call[2] for call in self.session.calls], [False] * (3 + index) + [True])
+                self.assertEqual(self.widget._prompts[axis].bbox, original_prompts[axis].bbox)
+            self.widget.on_undo()
+            self.assertEqual(len(self.widget._extra_prompts), 3)
+            for _ in range(3):
+                self.widget.on_undo()
+            self.assertFalse(self.widget._extra_prompts)
+            np.testing.assert_array_equal(self.widget._result_layer().data, original)
+            self.widget.on_undo()
+            self.assertFalse(self.widget._generated)
+
+    def test_add_lasso_cancel_keeps_mask_slice_and_history(self):
+        self.initialize(remote=False)
+        self.generate()
+        original = self.widget._result_layer().data.copy()
+        self.widget._set_slice(0, 1)
+        self.widget.add_lasso_button.click()
+        self.assertEqual(self.viewer.dims.current_step[0], 1)
+        self.widget.on_undo()
+        self.assertFalse(self.widget._adding_lasso)
+        self.assertFalse(self.widget._result_history)
+        np.testing.assert_array_equal(self.widget._result_layer().data, original)
+        self.widget.add_lasso_button.click()
+        self.widget.add_lasso_button.click()
+        self.assertFalse(self.widget._adding_lasso)
+        self.assertTrue(self.widget._generated)
+
+    def test_dilate_then_add_lasso_seeds_the_dilated_mask_and_undo_restores_it(self):
+        self.initialize(remote=True)
+        self.generate()
+        self.widget._dilate()
+        wait_worker(self.widget, "_task_worker")
+        dilated = self.widget._result_layer().data.copy()
+        self.widget.add_lasso_button.click()
+        self.draw(2)
+        wait_worker(self.widget, "_task_worker")
+        np.testing.assert_array_equal(self.session.seed, dilated)
+        self.widget.on_undo()
+        np.testing.assert_array_equal(self.widget._result_layer().data, dilated)
+        self.assertFalse(self.widget._extra_prompts)
+        # A further lasso after Undo replays the restored state, not a stale backend.
+        self.widget.add_lasso_button.click()
+        self.draw(1)
+        wait_worker(self.widget, "_task_worker")
+        self.assertEqual(len(self.session.calls), 4)
+
+    def test_manual_dilation_uses_native_paint_undo_and_disables_more_ai(self):
+        self.initialize(remote=False)
+        self.generate()
+        layer = self.widget._result_layer()
+        layer.data.fill(0)
+        centre = tuple(n // 2 for n in layer.data.shape)
+        layer.data[centre] = 1
+        self.widget.on_refine_manually()
+        original = layer.data.copy()
+        self.assertFalse(self.widget.add_lasso_button.isEnabled())
+        self.assertTrue(self.widget.dilate_button.isEnabled())
+        self.widget._dilate()
+        wait_worker(self.widget, "_task_worker")
+        self.assertEqual(np.count_nonzero(layer.data), 33)
+        self.widget.on_undo()
+        np.testing.assert_array_equal(layer.data, original)
+        self.assertTrue(self.widget._manual_refinement_active)
+
+    def test_failed_extra_prediction_keeps_previous_mask_and_history(self):
+        self.initialize(remote=True)
+        self.generate()
+        original = self.widget._result_layer().data.copy()
+        # Match a resumed session whose target is the live napari array.
+        self.session.target = self.widget._result_layer().data
+        self.widget.add_lasso_button.click()
+        with patch.object(self.session, "add_lasso_interaction", side_effect=RuntimeError("test failure")), \
+                patch("napari_nninteractive_beacon.widget_triplanar.show_error"):
+            self.draw(1)
+            wait_worker(self.widget, "_task_worker")
+        np.testing.assert_array_equal(self.widget._result_layer().data, original)
+        self.assertFalse(self.widget._extra_prompts)
+        self.assertFalse(self.widget._result_history)
+        self.assertTrue(self.widget._generated)
+        self.assertTrue(self.widget.add_lasso_button.isEnabled())
+
+    def test_disconnect_cancels_add_lasso_but_preserves_offline_dilation_and_export(self):
+        self.initialize(remote=True)
+        self.generate()
+        original = self.widget._result_layer().data.copy()
+        self.widget.add_lasso_button.click()
+        self.widget._unlock_session()
+        self.assertFalse(self.widget._adding_lasso)
+        self.assertFalse(self.widget.add_lasso_button.isEnabled())
+        self.assertTrue(self.widget.dilate_button.isEnabled())
+        self.assertTrue(self.widget.export_button.isEnabled())
+        self.assertFalse(self.widget._prompt_layer.visible)
+        np.testing.assert_array_equal(self.widget._result_layer().data, original)
 
     def test_active_sagittal_dicom_navigation_uses_the_working_grid(self):
         original_data = np.ones((5, 7, 9), dtype=np.float32)

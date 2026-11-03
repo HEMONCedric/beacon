@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import SimpleITK as sitk
 from napari_beacon_dicom.volume_reader import geometry_metadata, physical_matrix_zyx
+from .native_grid import grid_metadata, resample_exact
 
 
 MAX_WORKING_VOXELS = 512 * 1024**2
@@ -23,6 +24,8 @@ class PreparedVolume:
     data: np.ndarray
     display_matrix_zyx: np.ndarray
     plane_names: tuple[str, str, str]
+    source_data: np.ndarray | None = None
+    source_grid: dict | None = None
 
     def layer_transform(self) -> dict[str, Any]:
         """Viewer coordinates are independent of scanner coordinates."""
@@ -59,7 +62,8 @@ def image_from_layer(data: Any, matrix_zyx: np.ndarray, metadata: dict) -> sitk.
     array = np.asarray(data)
     if array.ndim != 3 or not np.issubdtype(array.dtype, np.number):
         raise ValueError("Choose a scalar 3D image")
-    image = sitk.GetImageFromArray(np.asarray(array, dtype=np.float32))
+    image = sitk.GetImageFromArray(np.asarray(array, dtype=np.float32) if array.dtype == np.float16
+                                   else np.ascontiguousarray(array))
     dicom = metadata.get("dicom", metadata.get("beacon_volume", {}))
     if all(key in dicom for key in (
         "spacing_xyz_mm", "origin_xyz_lps_mm", "direction_xyz_lps"
@@ -103,15 +107,9 @@ def prepare_volume(
     export_reference = image if export_reference is None else export_reference
     original = sitk.Image(export_reference.GetSize(), sitk.sitkUInt8)
     original.CopyInformation(export_reference)
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetSize([int(x) for x in size])
-    resampler.SetOutputSpacing((1.0, 1.0, 1.0))
-    resampler.SetOutputOrigin(image.GetOrigin())
-    resampler.SetOutputDirection(image.GetDirection())
-    resampler.SetInterpolator(sitk.sitkLinear)
-    resampler.SetUseNearestNeighborExtrapolator(True)
-    resampler.SetOutputPixelType(sitk.sitkFloat32)
-    working = resampler.Execute(image)
+    target_grid = grid_metadata(image)
+    target_grid.update(size_xyz=[int(x) for x in size], spacing_xyz_mm=[1., 1., 1.])
+    working = resample_exact(image, target_grid)
     array = sitk.GetArrayFromImage(working)
     reference = sitk.Image(working.GetSize(), sitk.sitkUInt8)
     reference.CopyInformation(working)
@@ -126,7 +124,10 @@ def prepare_volume(
     names = {"L": "Sagittal", "R": "Sagittal", "P": "Coronal",
              "A": "Coronal", "S": "Axial", "I": "Axial"}
     plane_names = tuple(names[letter] for letter in orientation[::-1])
-    return PreparedVolume(name, original, reference, array, display_matrix, plane_names)
+    source_data = sitk.GetArrayFromImage(image)
+    source_data.setflags(write=False)
+    return PreparedVolume(name, original, reference, array, display_matrix, plane_names,
+                          source_data, grid_metadata(image))
 
 
 def _same_voxels(array: np.ndarray, candidate: np.ndarray) -> bool:
@@ -162,7 +163,7 @@ def prepare_layer(
                         if transposed:
                             # Keep the active layer's array axes, but map them
                             # correctly to patient space and export on the file grid.
-                            layer_image = sitk.GetImageFromArray(np.asarray(array, dtype=np.float32))
+                            layer_image = sitk.GetImageFromArray(np.ascontiguousarray(array))
                             layer_image.SetSpacing(source.GetSpacing()[::-1])
                             layer_image.SetOrigin(source.GetOrigin())
                             direction = np.array(source.GetDirection()).reshape(3, 3) @ np.eye(3)[::-1]

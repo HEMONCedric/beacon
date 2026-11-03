@@ -1924,6 +1924,7 @@ dependencies = [
     { name = "napari-nninteractive", extra = ["local"] },
     { name = "numpy" },
     { name = "qtpy" },
+    { name = "scipy" },
     { name = "simpleitk" },
 ]
 
@@ -1934,6 +1935,7 @@ requires-dist = [
     { name = "napari-nninteractive", extras = ["local"], specifier = "==2.5.3" },
     { name = "numpy" },
     { name = "qtpy" },
+    { name = "scipy" },
     { name = "simpleitk" },
 ]
 

@@ -1,0 +1,7 @@
+FROM ghcr.io/mic-dkfz/nninteractive-server:latest
+# Reuse the official model/server installation; no GUI dependencies are added.
+COPY src/napari_nninteractive_beacon /opt/beacon-native/napari_nninteractive_beacon
+ENV PYTHONPATH=/opt/beacon-native
+ENV NNINTERACTIVE_MODEL_DIR=/opt/nninteractive
+ENTRYPOINT ["python", "-m", "napari_nninteractive_beacon.server_native"]
+CMD ["--host", "0.0.0.0", "--port", "1527", "--model", "nnInteractive_v1.0", "--max-sessions", "3"]
