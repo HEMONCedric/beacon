@@ -24,6 +24,7 @@ class FakeSession:
     preferred_scribble_thickness = (1, 1, 1)
     license = "test"
     supports_initial_label = True
+    device = SimpleNamespace(type="cuda")
 
     def __init__(self):
         self.calls = []
@@ -178,7 +179,7 @@ def wait_worker(widget, attribute):
     timer.start(5000)
     loop.exec()
     timer.stop()
-    if getattr(widget, attribute) is not None and attribute == "_task_worker":
+    if getattr(widget, attribute) is not None and attribute in ("_task_worker", "_beacon_worker"):
         raise AssertionError("Worker did not finish")
 
 
@@ -224,8 +225,10 @@ class WorkflowTests(unittest.TestCase):
                 widget.model_selection_local.blockSignals(True)
                 widget.model_selection_local.setText(checkpoint)
                 widget.model_selection_local.blockSignals(False)
-                with patch.object(widget, "_construct_local_session", side_effect=lambda: setattr(widget, "session", self.session)):
+                with patch("napari_nninteractive_beacon.widget_nninteractive.initialize_nninteractive",
+                           return_value=self.session):
                     widget.on_init()
+                    wait_worker(widget, "_beacon_worker")
         self.assertTrue(widget._session_ready)
         np.testing.assert_allclose(self.session.properties["spacing"], (1, 1, 1))
 

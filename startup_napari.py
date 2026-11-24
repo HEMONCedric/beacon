@@ -2,6 +2,10 @@ from patches.windows_opengl import configure_windows_opengl
 
 configure_windows_opengl()
 
+from patches.nninteractive_windows_fix import apply_nninteractive_windows_fix
+
+apply_nninteractive_windows_fix()
+
 import napari
 from napari import Viewer
 from napari_beacon_dicom import configure_dicom_reader_preference

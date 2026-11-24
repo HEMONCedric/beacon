@@ -32,7 +32,7 @@ Two groups of plugins were developed for AI-based segmentation: one based on the
 
 ### For 3D segmentation 
 
-- [**napari-nninteractive-beacon**](./packages/napari-nninteractive-beacon/) provides **BEACON Classic** and **BEACON 3-plane Lasso**. The latter uses one lasso in each anatomical plane, a 1 mm isotropic working image, local or remote nnInteractive inference, manual refinement and export on the original image grid.
+- [**BEACON**](./packages/napari-nninteractive-beacon/) provides **BEACON Classic** and **BEACON 3 Lasso**. Both offer local nnInteractive or IMPACT-OncoRep inference. The three-lasso workflow uses a 1 mm drawing grid and exports on the acquisition grid. nnInteractive also supports remote inference.
 
 The Minimal widget described below is now retained only for internal ARTIST study compatibility; it is no longer listed as a standalone plugin.
 
@@ -81,25 +81,67 @@ BEACON can be used on any device that supports napari (Windows/Macos). However, 
 
 ### Local installation
 
-For a local installation, clone the repository and install plugin packages in editable mode. We recommend [uv](https://github.com/astral-sh/uv) for this purpose.
+Install Git and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+On a new Windows machine you can install them from PowerShell, then open a new terminal.
 
-```bash
-# clone the repository and navigate into it
-git clone <repo-url> core_project && cd core_project
-
-# sync dependencies and install the plugins in editable mode
-uv sync
-# run the startup script. This opens napari with a demo study.
-uv run startup.py
-# alternatively start napari
-uv run napari
+```powershell
+winget install --id Git.Git --exact
+winget install --id astral-sh.uv --exact
 ```
+
+Clone the BEACON branch and install napari and the workspace plugins.
+
+```powershell
+git clone --branch feature/dicom3d-windows-opengl-ssh https://github.com/HEMONCedric/beacon.git
+cd beacon
+uv sync --locked
+```
+
+For local inference on an NVIDIA GPU with a current driver, install the CUDA
+builds matching the versions in the BEACON lockfile. The following pair uses
+[PyTorch 2.8 with CUDA 12.8](https://pytorch.org/get-started/previous-versions/#v280).
+
+```powershell
+uv pip install --index-url https://download.pytorch.org/whl/cu128 --reinstall-package torch --reinstall-package torchvision "torch==2.8.0+cu128" "torchvision==0.23.0+cu128"
+uv run --no-sync python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+For **nnInteractive**, download the official weights once. The plugin can also
+download them the first time you initialize.
+
+```powershell
+uv run --no-sync nninteractive-download-model nnInteractive_v1.0
+```
+
+For **IMPACT-OncoRep**, you need read access to the GitHub source repository and
+the Hugging Face weights repository. Authenticate Git with your usual GitHub
+credentials, then install the tested inference revision and cache the checkpoint.
+With GitHub CLI, `gh auth login` and `gh auth setup-git` configure Git access.
+
+```powershell
+uv pip install "impact-oncorep[hub] @ git+https://github.com/HEMONCedric/IMPACT-OncoRep.git@60c5283ecf3547f0cb7ac7db061dbb9de98bbf8a"
+uv run --no-sync hf auth login
+uv run --no-sync hf download HCedric/IMPACT-OncoRep interactive.pt --local-dir checkpoints/oncorep
+```
+
+BEACON uses the downloaded `checkpoints/oncorep/interactive.pt` on subsequent
+launches. An offline OncoRep workstation can use an installed wheel and a local
+copy of the weights. Enter a different path in the widget's **Checkpoint**
+field or set `ONCOREP_INTERACTIVE_WEIGHTS` before launch.
+
+```powershell
+uv run --no-sync startup_napari.py
+```
+
+Open **Plugins → BEACON → BEACON Classic** or **BEACON 3 Lasso**. Choose the
+model in **Settings**, select **Local** and initialize a 3D image. Use
+`--no-sync` for launches after installing optional OncoRep or CUDA wheels.
+`uv sync --locked` reapplies the base environment when updating it.
 
 On Windows, the `startup*.py` launchers configure Qt and VisPy to use the same
 software OpenGL library before napari starts. This avoids an OpenGL-context
 failure seen with some graphics drivers; set `QT_OPENGL=desktop` before launch
-to opt out. Other operating systems are unaffected. Plain `uv run napari`
-does not apply this launcher-specific workaround.
+to opt out. `startup.py` opens napari with the demo study.
 <details>
   <summary>Alternatively using `pip` and `venv`</summary>
 

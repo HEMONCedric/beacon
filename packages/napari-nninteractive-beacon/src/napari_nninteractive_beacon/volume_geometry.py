@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 import SimpleITK as sitk
-from napari_beacon_dicom.volume_reader import geometry_metadata, physical_matrix_zyx
+from napari_beacon_dicom.volume_reader import SEGMENTATION_MARKER, geometry_metadata, physical_matrix_zyx
 from .native_grid import grid_metadata, resample_exact
 
 
@@ -26,6 +26,7 @@ class PreparedVolume:
     plane_names: tuple[str, str, str]
     source_data: np.ndarray | None = None
     source_grid: dict | None = None
+    modality: str | None = None
 
     def layer_transform(self) -> dict[str, Any]:
         """Viewer coordinates are independent of scanner coordinates."""
@@ -42,19 +43,15 @@ class PreparedVolume:
     def mask_in_original_space(self, mask: np.ndarray) -> sitk.Image:
         if tuple(mask.shape[::-1]) != self.working.GetSize():
             raise ValueError("The segmentation does not match the working volume")
-        labels = sitk.GetImageFromArray(np.asarray(mask, dtype=np.uint8))
-        labels.CopyInformation(self.working)
-        return sitk.Resample(
-            labels, self.original, sitk.Transform(), sitk.sitkNearestNeighbor,
-            0, sitk.sitkUInt8,
-        )
+        return labels_on_original_grid(mask, self.working, self.original)
 
     def original_display_reference(self) -> dict[str, Any]:
-        matrix = self.display_matrix_zyx @ np.linalg.solve(
-            physical_matrix_zyx(self.working), physical_matrix_zyx(self.original)
-        )
-        return {"geometry": geometry_metadata(self.original),
-                "display_matrix_zyx": matrix.tolist()}
+        return export_display_reference(self.display_matrix_zyx, self.working, self.original)
+
+
+def export_display_reference(matrix_zyx, displayed, original):
+    matrix = matrix_zyx @ np.linalg.solve(physical_matrix_zyx(displayed), physical_matrix_zyx(original))
+    return {"geometry": geometry_metadata(original), "display_matrix_zyx": matrix.tolist()}
 
 
 def image_from_layer(data: Any, matrix_zyx: np.ndarray, metadata: dict) -> sitk.Image:
@@ -90,7 +87,7 @@ def image_from_layer(data: Any, matrix_zyx: np.ndarray, metadata: dict) -> sitk.
 
 def prepare_volume(
     image: sitk.Image, name: str, display_matrix_zyx: np.ndarray | None = None,
-    export_reference: sitk.Image | None = None,
+    export_reference: sitk.Image | None = None, modality: str | None = None,
 ) -> PreparedVolume:
     if image.GetDimension() != 3 or image.GetNumberOfComponentsPerPixel() != 1:
         raise ValueError("Choose a scalar 3D image")
@@ -127,7 +124,7 @@ def prepare_volume(
     source_data = sitk.GetArrayFromImage(image)
     source_data.setflags(write=False)
     return PreparedVolume(name, original, reference, array, display_matrix, plane_names,
-                          source_data, grid_metadata(image))
+                          source_data, grid_metadata(image), modality)
 
 
 def _same_voxels(array: np.ndarray, candidate: np.ndarray) -> bool:
@@ -139,10 +136,8 @@ def _same_voxels(array: np.ndarray, candidate: np.ndarray) -> bool:
                for start in range(0, array.shape[0], 16))
 
 
-def prepare_layer(
-    data: Any, matrix_zyx: np.ndarray, metadata: dict, name: str,
-    source_path: str | None = None,
-) -> PreparedVolume:
+def read_layer_image(data, matrix_zyx, metadata, source_path=None):
+    """Return the calibrated layer array and its acquisition grid."""
     # Some napari NIfTI readers retain a unit layer scale and keep the header
     # geometry only in the source file. Recover it when the layer still contains
     # that file's voxels (in either z/y/x or x/y/z array order).
@@ -168,9 +163,21 @@ def prepare_layer(
                             layer_image.SetOrigin(source.GetOrigin())
                             direction = np.array(source.GetDirection()).reshape(3, 3) @ np.eye(3)[::-1]
                             layer_image.SetDirection(tuple(direction.ravel()))
-                            return prepare_volume(layer_image, name, matrix_zyx, source)
-                        return prepare_volume(source, name, matrix_zyx)
-    return prepare_volume(image_from_layer(data, matrix_zyx, metadata), name, matrix_zyx)
+                            return layer_image, source
+                        return source, source
+    image = image_from_layer(data, matrix_zyx, metadata)
+    return image, image
+
+
+def declared_modality(metadata):
+    dicom = metadata.get("dicom", {})
+    declared = dicom.get("modality") if isinstance(dicom, dict) else None
+    return declared or metadata.get("modality") or metadata.get("image_modality")
+
+
+def prepare_layer(data, matrix_zyx, metadata, name, source_path=None) -> PreparedVolume:
+    image, original = read_layer_image(data, matrix_zyx, metadata, source_path)
+    return prepare_volume(image, name, matrix_zyx, original, declared_modality(metadata))
 
 
 def prepare_path(path: str) -> PreparedVolume:
@@ -190,7 +197,29 @@ def prepare_path(path: str) -> PreparedVolume:
             image = read_dicom_image(source)
         else:
             image = sitk.ReadImage(str(source))
-    return prepare_volume(image, source.name)
+    modality = image.GetMetaData("0008|0060") if image.HasMetaDataKey("0008|0060") else None
+    return prepare_volume(image, source.name, modality=modality)
+
+
+def labels_on_original_grid(mask, displayed, original):
+    """Restore patient geometry and retain integer labels, including instance IDs."""
+    array = np.asarray(mask)
+    if array.dtype == bool:
+        array = array.astype(np.uint8)
+    labels = sitk.GetImageFromArray(np.ascontiguousarray(array))
+    labels.CopyInformation(displayed)
+    if displayed.IsSameImageGeometryAs(original):
+        return labels
+    return sitk.Resample(
+        labels, original, sitk.Transform(), sitk.sitkNearestNeighbor, 0, labels.GetPixelID(),
+    )
+
+
+def write_segmentation(image, path):
+    image.SetMetaData("descrip", SEGMENTATION_MARKER)
+    image.SetMetaData("ITK_FileNotes", SEGMENTATION_MARKER)
+    image.SetMetaData("beacon_segmentation", "1")
+    sitk.WriteImage(image, str(path), True)
 
 
 @dataclass
@@ -213,17 +242,22 @@ class LassoPrompt:
             raise ValueError("The lasso is empty")
 
 
+def submit_lasso(session, prompt, predict):
+    if hasattr(session, "add_beacon_lasso"):
+        return session.add_beacon_lasso(prompt, predict)
+    return session.add_lasso_interaction(
+        prompt.crop, True, run_prediction=predict, interaction_bbox=prompt.bbox,
+    )
+
+
 def predict_three_lassos(session, prompts: list[LassoPrompt], shape: tuple[int, ...]) -> np.ndarray:
     if {prompt.axis for prompt in prompts} != {0, 1, 2} or len(prompts) != 3:
         raise ValueError("Draw one lasso in each of the three planes before generating")
     for prompt in prompts:
         prompt.validate(shape)
     target = np.zeros(shape, dtype=np.uint8)
-    session.reset_interactions()
     session.set_target_buffer(target)
+    session.reset_interactions()
     for index, prompt in enumerate(prompts):
-        session.add_lasso_interaction(
-            prompt.crop, True, run_prediction=index == 2,
-            interaction_bbox=prompt.bbox,
-        )
+        submit_lasso(session, prompt, index == 2)
     return target

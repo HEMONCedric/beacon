@@ -1,21 +1,99 @@
 from __future__ import annotations
 
+import json
+import logging
+import os
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+import SimpleITK as sitk
 from napari.layers.labels._labels_constants import Mode
 from napari.qt.threading import create_worker
-from napari.utils.notifications import show_warning
+from napari.utils.notifications import show_info, show_warning
 from napari_beacon_layers import ManualLabelsLayer
 from napari_nninteractive import nnInteractiveWidget
-from qtpy.QtWidgets import QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton
+from qtpy.QtCore import Signal
+from qtpy.QtWidgets import (
+    QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QProgressBar, QPushButton, QWidget,
+)
 
+from .native_grid import grid_metadata
 from .ssh_tunnel import DEFAULT_SERVER_URL, SSH_TARGET_SETTING, manager, spec_from_url
+from .volume_geometry import (
+    declared_modality, export_display_reference, labels_on_original_grid, read_layer_image, write_segmentation,
+)
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def initialize_nninteractive(checkpoint_text, model_id, compile_model, autozoom, storage):
+    import nnInteractive
+    import torch
+    from nnInteractive.model_management import ensure_model_available
+    from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
+
+    checkpoint = Path(checkpoint_text) if checkpoint_text else None
+    if checkpoint is None or not checkpoint.exists():
+        checkpoint = ensure_model_available(model_id)
+    class_file = checkpoint / "inference_session_class.json"
+    inference_class = json.loads(class_file.read_text()) if class_file.is_file() else "nnInteractiveInferenceSession"
+    if isinstance(inference_class, dict):
+        inference_class = inference_class["inference_class"]
+    factory = recursive_find_python_class(
+        str(Path(nnInteractive.__path__[0]) / "inference"), inference_class, "nnInteractive.inference",
+    )
+    if factory is None:
+        raise ValueError(f"Unknown nnInteractive inference class: {inference_class}")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    session = factory(
+        device=device, use_torch_compile=compile_model, torch_n_threads=os.cpu_count() or 1,
+        verbose=False, do_autozoom=autozoom and device.type == "cuda", interactions_storage=storage,
+    )
+    session.initialize_from_trained_model_folder(str(checkpoint), 0, "checkpoint_final.pth")
+    return session
+
+
+def initialize_oncorep(weights, modality, layer_args, prepared, progress):
+    try:
+        from .oncorep_session import OncoRepSession, resolve_modality
+    except ModuleNotFoundError as error:
+        if error.name != "oncorep":
+            raise
+        raise RuntimeError("Install IMPACT-OncoRep following BEACON's Local installation guide.") from error
+
+    if prepared is not None:
+        native_data, native_grid = prepared.source_data, prepared.source_grid
+        displayed, original = prepared.working, prepared.original
+        metadata_modality = prepared.modality
+    else:
+        displayed, original = read_layer_image(*layer_args)
+        native_data = sitk.GetArrayViewFromImage(displayed)
+        native_grid = grid_metadata(displayed)
+        metadata_modality = declared_modality(layer_args[2])
+    modality = resolve_modality(modality, metadata_modality, native_data)
+    progress("Loading IMPACT-OncoRep weights…")
+    session = OncoRepSession(weights)
+    session.set_volume(native_data, native_grid, displayed, modality, progress)
+    return session, (displayed, original)
+
+
+def export_classic_masks(input_args, geometry, output, masks):
+    displayed, original = geometry if geometry is not None else read_layer_image(*input_args)
+    output.mkdir(exist_ok=True)
+    for filename, mask in masks:
+        write_segmentation(labels_on_original_grid(mask, displayed, original), output / filename)
+    return str(output), export_display_reference(input_args[1], displayed, original)
 
 
 class nnInteractiveWidgetBeacon(nnInteractiveWidget):
     """nnInteractive Classic with an explicit final manual-refinement phase."""
 
+    backend_progress = Signal(str)
+    _supports_oncorep = True
+    _background_classic_prompts = True
     _AI_CONTROLS = (
         "init_button",
         "prompt_button",
@@ -41,6 +119,10 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         self._saved_prompt_editability: dict[str, bool] = {}
         self._saved_prompt_modes: dict[str, Any] = {}
         self._ssh_tunnel_worker = None
+        self._beacon_worker = None
+        self._oncorep_export_reference = None
+        self._active_oncorep_options = None
+        self._classic_nninteractive_target = None
 
         super().__init__(napari_viewer, *args, **kwargs)
         from qtpy.QtWidgets import QSizePolicy
@@ -59,13 +141,55 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         self.refine_manual_button.clicked.connect(self.on_refine_manually)
         self._insert_manual_refinement_button()
         self.refine_manual_button.setEnabled(self.session is not None)
+        self._nninteractive_autorefine_tooltip = self.auto_refine.toolTip()
+        self.backend_progress.connect(self._show_backend_phase)
 
     def _init_model_selection(self) -> QGroupBox:
-        group = super()._init_model_selection()
+        if self._supports_oncorep and self._local_available:
+            # The upstream widget fetches the Hugging Face manifest synchronously
+            # during construction. Use its validated disk cache for these docks.
+            self._local_available = False
+            try:
+                group = super()._init_model_selection()
+            finally:
+                self._local_available = True
+            self._load_cached_nninteractive_models()
+        else:
+            group = super()._init_model_selection()
         if not self.server_url_edit.text().strip():
             self.server_url_edit.blockSignals(True)
             self.server_url_edit.setText(DEFAULT_SERVER_URL)
             self.server_url_edit.blockSignals(False)
+        self.backend_status = QLabel()
+        self.backend_status.setWordWrap(True)
+        self.backend_spinner = QProgressBar()
+        self.backend_spinner.setRange(0, 0)
+        self.backend_spinner.setTextVisible(False)
+        self.backend_status.hide()
+        self.backend_spinner.hide()
+        if self._supports_oncorep:
+            self.engine_combo = QComboBox()
+            self.engine_combo.addItem("nnInteractive", "nninteractive")
+            self.engine_combo.addItem("IMPACT-OncoRep", "oncorep")
+            engines = QFormLayout()
+            engines.addRow("Model", self.engine_combo)
+            group.layout().insertLayout(0, engines)
+            self.oncorep_options = QWidget()
+            options = QFormLayout(self.oncorep_options)
+            options.setContentsMargins(0, 0, 0, 0)
+            self.oncorep_weights = QLineEdit(os.environ.get("ONCOREP_INTERACTIVE_WEIGHTS", ""))
+            self.oncorep_weights.setPlaceholderText("Released interactive.pt")
+            self.oncorep_weights.setToolTip("Use the Hub release, or enter a local interactive.pt file.")
+            self.oncorep_modality = QComboBox()
+            for label, value in (("Auto", "Auto"), ("CT (HU)", "CT"), ("MR", "MR"), ("PET (SUV)", "PET")):
+                self.oncorep_modality.addItem(label, value)
+            options.addRow("Checkpoint", self.oncorep_weights)
+            options.addRow("Modality", self.oncorep_modality)
+            group.layout().insertWidget(3, self.oncorep_options)
+            self.oncorep_options.hide()
+            self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+            self.oncorep_modality.currentIndexChanged.connect(self._on_oncorep_settings_changed)
+            self.oncorep_weights.editingFinished.connect(self._on_oncorep_settings_changed)
 
         saved = self._settings.value(
             SSH_TARGET_SETTING,
@@ -89,11 +213,280 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         self.remote_container.layout().insertLayout(1, row)
         return group
 
+    def _load_cached_nninteractive_models(self):
+        from nnInteractive.model_management import get_model_root_dir
+
+        self.local_container.setEnabled(True)
+        self.mode_switch._uncheck()
+        self.mode_switch._check(int(self._remote_mode))
+        self.mode_switch.buttons[0].setToolTip("Run inference locally")
+        try:
+            path = get_model_root_dir() / "models.json"
+            models = json.loads(path.read_text(encoding="utf-8"))["models"]
+            models = [item for item in models if str(item["id"]).startswith("nnInteractive_")]
+        except (OSError, KeyError, TypeError, ValueError):
+            models = []
+        if not models:
+            models = [{"id": "nnInteractive_v1.0", "display_name": "nnInteractive v1.0", "default": True}]
+        self._model_ids = [item["id"] for item in models]
+        default = next((index for index, item in enumerate(models) if item.get("default")), 0)
+        self.model_selection.blockSignals(True)
+        self.model_selection.addItems([item.get("display_name", item["id"]) for item in models])
+        self.model_selection.setCurrentIndex(default)
+        self.model_selection.blockSignals(False)
+
+    def _oncorep_selected(self):
+        return self._supports_oncorep and self.engine_combo.currentData() == "oncorep"
+
+    def _on_engine_changed(self):
+        oncorep = self._oncorep_selected()
+        if oncorep and self._remote_mode:
+            self.mode_switch._uncheck()
+            self.mode_switch._check(0)
+            self.on_mode_switched()
+        else:
+            self.on_model_selected()
+        self.mode_switch.buttons[1].setEnabled(not oncorep)
+        self.local_container.setVisible(not self._remote_mode and not oncorep)
+        self.remote_container.setVisible(self._remote_mode and not oncorep)
+        self.oncorep_options.setVisible(oncorep)
+        self.auto_refine.setToolTip(self._nninteractive_autorefine_tooltip)
+        self.backend_status.hide()
+
+    def _on_oncorep_settings_changed(self):
+        if self._oncorep_selected() and self.session is not None and self._beacon_worker is None:
+            if self._active_oncorep_options != self._oncorep_settings():
+                self.on_model_selected()
+                self.backend_status.hide()
+
+    def _oncorep_settings(self):
+        weights = self.oncorep_weights.text().strip()
+        local_release = Path("checkpoints/oncorep/interactive.pt")
+        if not weights and local_release.is_file():
+            weights = str(local_release.resolve())
+        return weights, self.oncorep_modality.currentData()
+
+    def _show_backend_phase(self, message):
+        self.backend_status.setText(message)
+        self.backend_status.show()
+
+    def _run_backend_worker(self, function, args, message, done, failed=None):
+        if self._beacon_worker is not None:
+            return
+        widgets = [
+            self.init_button, self.reset_button, self.image_selection, self.mode_switch,
+            self.local_container, self.remote_container, self.propagate_ckbx,
+            self.prompt_button, self.interaction_button, self.reset_interaction_button,
+            self.undo_button, self.run_button, self.export_button, self.load_mask_btn,
+            self.auto_run_ckbx, self.refine_manual_button,
+        ]
+        if self._supports_oncorep:
+            widgets.extend((self.engine_combo, self.oncorep_options))
+        states = [(widget, widget.isEnabled()) for widget in widgets]
+        for widget, _ in states:
+            widget.setEnabled(False)
+        prompts = []
+        for name in self.layer_dict.values():
+            if name in self._viewer.layers:
+                layer = self._viewer.layers[name]
+                if layer.editable:
+                    prompts.append((layer, layer.mode))
+                    layer.editable = False
+        self._show_backend_phase(message)
+        self.backend_spinner.show()
+        worker = create_worker(function, *args, _start_thread=False, _ignore_errors=True)
+        self._beacon_worker = worker
+        self._backend_busy_changed()
+
+        def restore():
+            self._beacon_worker = None
+            self.backend_spinner.hide()
+            for widget, enabled in states:
+                widget.setEnabled(enabled)
+            for layer, mode in prompts:
+                if layer in self._viewer.layers:
+                    layer.editable = True
+                    layer.mode = mode
+            self._backend_busy_changed()
+
+        def succeeded(result):
+            restore()
+            done(result)
+
+        def errored(error):
+            restore()
+            self._show_backend_phase(str(error))
+            show_warning(str(error))
+            if failed is not None:
+                failed()
+
+        worker.returned.connect(succeeded)
+        worker.errored.connect(errored)
+        worker.start()
+
+    def _backend_busy_changed(self):
+        pass
+
+    @staticmethod
+    def _layer_args(layer):
+        return layer.data, layer._data_to_world.affine_matrix.copy(), dict(layer.metadata), layer.source.path
+
+    def _prepared_for_oncorep(self):
+        return None
+
+    def on_init(self, *args, **kwargs):
+        if self._beacon_worker is not None:
+            return
+        if not self._oncorep_selected():
+            if self._supports_oncorep and self._local_available and not self._remote_mode and self.session is None:
+                return self._init_nninteractive_local()
+            return super().on_init(*args, **kwargs)
+        name = self.image_selection.currentText()
+        if name not in self._viewer.layers:
+            show_warning("Choose a scalar 3D image first.")
+            return self._backend_init_failed()
+        layer = self._viewer.layers[name]
+        if layer.ndim != 3 or layer.rgb or layer.multiscale:
+            show_warning("IMPACT-OncoRep requires a scalar 3D image.")
+            return self._backend_init_failed()
+        settings = self._oncorep_settings()
+        self._run_backend_worker(
+            initialize_oncorep,
+            (*settings, self._layer_args(layer), self._prepared_for_oncorep(), self.backend_progress.emit),
+            "Initializing IMPACT-OncoRep…",
+            lambda result: self._oncorep_initialized(layer, settings, result),
+            self._backend_init_failed,
+        )
+
+    def _init_nninteractive_local(self):
+        name = self.image_selection.currentText()
+        if name not in self._viewer.layers:
+            show_warning("Choose an image first.")
+            return self._backend_init_failed()
+        image = self._viewer.layers[name]
+        index = self.model_selection.currentIndex()
+        model_id = self._model_ids[index] if 0 <= index < len(self._model_ids) else "nnInteractive_v1.0"
+        options = (self.model_selection_local.text(), model_id, self.use_torch_compile_ckbx.isChecked(),
+                   self.propagate_ckbx.isChecked(), self.interactions_storage_combo.currentText())
+
+        def done(session):
+            if image not in self._viewer.layers or self.image_selection.currentText() != image.name:
+                self._show_backend_phase("The selected image changed. Initialize again.")
+                return self._backend_init_failed()
+            self.session = session
+            self._local_running_on_cpu = session.device.type == "cpu"
+            if self._local_running_on_cpu:
+                self.propagate_ckbx.setChecked(False)
+            try:
+                # The downloaded model is already loaded and warmed up. Let
+                # napari-nninteractive configure its regular layers and image.
+                super(nnInteractiveWidgetBeacon, self).on_init()
+            except Exception as error:
+                self.session = None
+                self._show_backend_phase(str(error))
+                show_warning(str(error))
+                return self._backend_init_failed()
+            self._show_backend_phase(f"nnInteractive ready · {str(session.device).upper()}")
+
+        self._run_backend_worker(
+            initialize_nninteractive, options, "Loading nnInteractive…", done, self._backend_init_failed,
+        )
+
+    def _backend_init_failed(self):
+        self._unlock_session()
+
+    def _oncorep_initialized(self, image, settings, initialized):
+        if image not in self._viewer.layers or self.image_selection.currentText() != image.name:
+            self._show_backend_phase("The selected image changed. Initialize again.")
+            self._backend_init_failed()
+            return
+        self.session, self._oncorep_export_reference = initialized
+        self._active_oncorep_options = settings
+        self.source_cfg = {
+            "name": image.name, "model": "IMPACT-OncoRep", "ndim": image.ndim,
+            "shape": image.data.shape, "affine": image.affine, "scale": image.scale,
+            "translate": image.translate, "rotate": image.rotate, "shear": image.shear,
+            "source": image.source, "metadata": image.metadata,
+        }
+        self.session_cfg = self.source_cfg.copy()
+        self.session_cfg["spacing"] = np.asarray(self._oncorep_export_reference[0].GetSpacing()[::-1])
+        layer = self._viewer.layers[self.label_layer_name] if self.label_layer_name in self._viewer.layers else None
+        resume = (
+            self._resume_after_reconnect and self._resume_image_layer is image
+            and layer is not None and layer.data.shape == image.data.shape
+        )
+        if resume:
+            self._data_result = layer.data
+        else:
+            self._data_result = np.zeros(image.data.shape, dtype=np.uint8)
+            self.object_index = self._next_object_index()
+            if layer is not None:
+                self._viewer.layers.remove(layer)
+            self.add_label_layer(self._data_result, self.label_layer_name)
+            self._viewer.layers[self.label_layer_name].colormap = self.colormap[self.object_index]
+        # A worker owns the model buffer; Qt publishes completed results itself.
+        self.session.set_target_buffer(np.zeros_like(self._data_result))
+        self._resume_image_layer = image
+        self._interaction_history = []
+        self._reset_object_bbox()
+        self._local_running_on_cpu = False  # Display the actual device in BEACON's status below.
+        self._lock_session()
+        self._set_interaction_button_support(dict.fromkeys(range(4), True))
+        self.auto_refine.setEnabled(False)
+        self.auto_refine.setToolTip("OncoRep uses the initial mask with the next prompt.")
+        self._update_license_display(self.session.license)
+        self._finish_init()
+        self._show_backend_phase(
+            f"OncoRep ready · {self.session.modality} · {str(self.session.device).upper()} · "
+            f"preprocessing {self.session.preprocess_s:.1f} s"
+        )
+        LOGGER.info(self.backend_status.text())
+
+    def _oncorep_session(self):
+        return getattr(self.session, "segmentation_engine", "") == "oncorep"
+
+    def _finish_init(self):
+        super()._finish_init()
+        if (self._supports_oncorep and self._background_classic_prompts
+                and self.session is not None and not self._remote_mode and not self._oncorep_session()):
+            self._classic_nninteractive_target = self._data_result.copy()
+            self.session.set_target_buffer(self._classic_nninteractive_target)
+
+    def _async_prompts(self):
+        return self.session is not None and (self._oncorep_session() or self._classic_nninteractive_target is not None)
+
+    def _publish_async_result(self, bbox=None):
+        if self._oncorep_session():
+            return self._publish_oncorep()
+        if self.label_layer_name not in self._viewer.layers:
+            return
+        section = tuple(slice(lo, hi) for lo, hi in bbox) if bbox is not None else (...,)
+        np.copyto(self._data_result[section], self._classic_nninteractive_target[section])
+        self._accumulate_object_bbox(bbox)
+        self._viewer.layers[self.label_layer_name].refresh()
+        self._show_backend_phase("nnInteractive segmentation ready.")
+
+    def _publish_oncorep(self, _result=None):
+        if self.label_layer_name not in self._viewer.layers:
+            return
+        np.copyto(self._data_result, self.session.target)
+        self._object_bbox_reliable = False
+        self._viewer.layers[self.label_layer_name].refresh()
+        summary = (
+            f"OncoRep · inference {self.session.last_prediction_s:.2f} s · "
+            f"mask projection {self.session.last_projection_s:.2f} s"
+        )
+        self._show_backend_phase(summary)
+        LOGGER.info(summary)
+
     def _set_connecting(self, connecting: bool) -> None:
         super()._set_connecting(connecting)
         ssh_edit = getattr(self, "ssh_target_edit", None)
         if ssh_edit is not None:
             ssh_edit.setEnabled(not connecting)
+        engine = getattr(self, "engine_combo", None)
+        if engine is not None:
+            engine.setEnabled(not connecting)
 
     def _start_claim(self, on_connected=None) -> None:
         """Open a localhost tunnel in a worker, then claim the remote session."""
@@ -143,6 +536,8 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
             layout.addWidget(self.refine_manual_button)
         else:
             layout.insertWidget(index, self.refine_manual_button)
+        layout.addWidget(self.backend_status)
+        layout.addWidget(self.backend_spinner)
 
     def add_label_layer(self, data, name) -> None:
         if name != self.label_layer_name:
@@ -251,51 +646,194 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         self._on_manual_refinement_finished()
 
     def add_interaction(self, *_args: Any, **_kwargs: Any):
-        if self._manual_refinement_active:
+        if self._manual_refinement_active or self._beacon_worker is not None or self.session is None:
             return None
-        return super().add_interaction()
+        if not self._async_prompts():
+            return super().add_interaction()
+        tool = self.interaction_button.index
+        name = self.layer_dict.get(tool)
+        if name not in self._viewer.layers:
+            return
+        layer = self._viewer.layers[name]
+        if layer.is_free():
+            return
+        data = layer.get_last()
+        layer.run()
+        if data is None:
+            return
+        positive = self.prompt_button.index == 0
+        run = self.auto_run_ckbx.isChecked()
+        if tool == 0:
+            operation, args = self.session.add_point_interaction, (data, positive, run)
+        elif tool == 1:
+            operation = self.session.add_bbox_interaction
+            args = self._bbox_to_half_open_intervals(data), positive, run
+        else:
+            crop, bbox = data
+            args = crop.copy(), positive, run, bbox
+            if tool == 2:
+                operation = self.session.add_scribble_interaction
+            else:
+                operation = self.session.add_lasso_interaction
+                axes = self._viewer.dims.not_displayed
+                if self._oncorep_session():
+                    args += (axes[0] if len(axes) == 1 else None,)
+
+        def done(bbox):
+            self._interaction_history.append(name)
+            if run:
+                self._publish_async_result(bbox)
+
+        def undo_marker():
+            if layer in self._viewer.layers:
+                layer.remove_last()
+                layer.refresh()
+
+        if run:
+            self._run_backend_worker(operation, args, "Segmenting…", done, undo_marker)
+        else:
+            try:
+                done(operation(*args))
+            except ValueError as error:
+                undo_marker()
+                show_warning(str(error))
 
     def on_run(self, *_args: Any, **_kwargs: Any):
-        if self._manual_refinement_active:
+        if self._manual_refinement_active or self._beacon_worker is not None:
             return None
+        if self._async_prompts():
+            return self._run_backend_worker(
+                self.session._predict, (), "Segmenting…", self._publish_async_result,
+            )
         return super().on_run()
 
     def on_reset_interactions(self, *_args: Any, **_kwargs: Any):
-        if self._manual_refinement_active:
+        if self._manual_refinement_active or self._beacon_worker is not None:
             return None
-        return super().on_reset_interactions()
+        result = super().on_reset_interactions()
+        if self._async_prompts():
+            self._publish_async_result()
+        return result
 
     def on_undo(self, *_args: Any, **_kwargs: Any):
-        if self._manual_refinement_active:
+        if self._manual_refinement_active or self._beacon_worker is not None:
             return None
-        return super().on_undo()
+        result = super().on_undo()
+        if self._async_prompts():
+            self._publish_async_result()
+        return result
 
     def on_load_mask(self, *_args: Any, **_kwargs: Any):
-        if self._manual_refinement_active:
+        if self._manual_refinement_active or self._beacon_worker is not None:
             return None
-        return super().on_load_mask()
+        if not self._async_prompts():
+            return super().on_load_mask()
+        selected = self.label_for_init.currentText()
+        if selected not in self._viewer.layers:
+            show_warning("Choose a Labels layer first.")
+            return
+        labels = self._viewer.layers[selected]
+        if (labels.data.shape != self._data_result.shape or not np.allclose(
+            labels._data_to_world.affine_matrix,
+            self._viewer.layers[self.source_cfg["name"]]._data_to_world.affine_matrix,
+        )):
+            show_warning("The initial mask must match the selected image grid.")
+            return
+        mask, label = labels.data, self.class_for_init.value()
+        oncorep = self._oncorep_session()
+        auto_refine = not oncorep and self.auto_refine.isChecked()
+
+        def seed():
+            binary = mask == label
+            if not binary.any():
+                raise ValueError("The selected label is empty.")
+            self.session.add_initial_seg_interaction(binary.astype(np.uint8), run_prediction=auto_refine)
+
+        def done(_result):
+            self._interaction_history.append(None)
+            self._publish_async_result()
+            if oncorep:
+                self._show_backend_phase("Initial mask set. Draw an OncoRep prompt to refine it.")
+
+        self._run_backend_worker(seed, (), "Loading the initial mask…", done)
 
     def on_interaction_shortcut(self, idx: int) -> None:
-        if self._manual_refinement_active:
+        if self._manual_refinement_active or self._beacon_worker is not None:
             return
         super().on_interaction_shortcut(idx)
 
     def on_next(self, *args: Any, **kwargs: Any):
-        if self.label_layer_name not in self._viewer.layers:
+        if self._beacon_worker is not None or self.label_layer_name not in self._viewer.layers:
             return None
         if not np.any(np.asarray(self._viewer.layers[self.label_layer_name].data)):
             return None
 
         was_manual = self._manual_refinement_active
         result = super().on_next(*args, **kwargs)
+        if self._async_prompts():
+            # The upstream reset clears the backend's private target buffer.
+            self._data_result.fill(0)
+            self._viewer.layers[self.label_layer_name].refresh()
 
         if was_manual:
             self._finish_manual_refinement_after_next()
 
         return result
 
+    def on_uninit(self, *args, **kwargs):
+        if self._beacon_worker is None:
+            return super().on_uninit(*args, **kwargs)
+
+    def _export(self):
+        if self._beacon_worker is not None or not self.source_cfg:
+            return
+        image_name = self.source_cfg["name"]
+        if self.source_cfg["ndim"] != 3 or not self._supports_oncorep:
+            return super()._export()
+        if image_name not in self._viewer.layers:
+            show_warning("Open the source image before exporting its segmentation.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Select an output folder")
+        if not folder:
+            return
+        image = self._viewer.layers[image_name]
+        base = Path(image.source.path).name if image.source.path else image_name
+        base = base.removesuffix(".gz")
+        base = Path(base).stem
+        self.on_next()
+        objects = []
+        for layer in self._viewer.layers:
+            if layer.name.startswith("object ") and layer.name.endswith(f" - {image_name}"):
+                index = layer.name.removesuffix(f" - {image_name}").removeprefix("object ")
+                if index.isdigit():
+                    objects.append((f"{base}_{int(index):04d}.nii.gz", layer.data))
+            elif layer.name in (f"instance map - {image_name}", f"semantic map - {image_name}"):
+                name = layer.name.split(" - ", 1)[0].replace(" ", "_")
+                objects.append((f"{base}_{name}.nii.gz", layer.data))
+        if not objects:
+            show_warning("There is no segmentation to export.")
+            return
+        oncorep = self._oncorep_session()
+        geometry = self._oncorep_export_reference if oncorep else None
+        backend = "OncoRep" if oncorep else "nnInteractive"
+
+        def done(result):
+            saved, reference = result
+            if image in self._viewer.layers:
+                image.metadata["beacon_export_reference"] = reference
+            self._show_backend_phase(f"Exported: {saved}")
+            show_info(f"Exported: {saved}")
+
+        self._run_backend_worker(
+            export_classic_masks,
+            (self._layer_args(image), geometry, Path(folder) / f"{base}_{backend}", objects),
+            "Exporting on the original grid…",
+            done,
+        )
+
     def _unlock_session(self) -> None:
         super()._unlock_session()
+        self._classic_nninteractive_target = None
         self._manual_refinement_active = False
         self._saved_ai_control_states.clear()
         self._saved_prompt_editability.clear()

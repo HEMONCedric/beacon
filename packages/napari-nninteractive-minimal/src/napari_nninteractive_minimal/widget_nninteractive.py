@@ -23,6 +23,8 @@ class nnInteractiveWidgetMinimal(nnInteractiveWidgetBeacon):
     ARTIST study events.
     """
 
+    _supports_oncorep = False
+
     def __init__(
         self,
         napari_viewer,

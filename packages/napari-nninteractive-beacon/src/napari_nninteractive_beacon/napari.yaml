@@ -1,6 +1,6 @@
 name: napari-nninteractive-beacon
-display_name: nnInteractive BEACON
-visibility: hidden
+display_name: BEACON
+visibility: public
 categories:
   - Segmentation
   - Annotation
@@ -8,14 +8,14 @@ categories:
 contributions:
   commands:
     - id: napari-nninteractive-beacon.make_widget
-      title: nnInteractive BEACON Classic
+      title: BEACON Classic
       python_name: napari_nninteractive_beacon:nnInteractiveWidgetBeacon
     - id: napari-nninteractive-beacon.make_triplanar_widget
-      title: nnInteractive BEACON Three-plane Lasso
+      title: BEACON 3 Lasso
       python_name: napari_nninteractive_beacon:nnInteractiveWidgetTriplanar
 
   widgets:
     - command: napari-nninteractive-beacon.make_widget
-      display_name: nnInteractive (BEACON Classic)
+      display_name: BEACON Classic
     - command: napari-nninteractive-beacon.make_triplanar_widget
-      display_name: nnInteractive (BEACON 3-plane Lasso)
+      display_name: BEACON 3 Lasso

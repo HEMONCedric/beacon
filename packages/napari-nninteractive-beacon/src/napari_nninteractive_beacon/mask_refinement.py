@@ -68,12 +68,13 @@ def refine_with_lassos(session, mask, prompts, extra_count):
     # Reconnect can leave the backend pointing at the live napari array.
     # Detach it before reset (which clears its target in-place), so a failed
     # request cannot erase the displayed mask from the worker thread.
-    session.reset_interactions()
+    getattr(session, "reset_for_refinement", session.reset_interactions)()
     if np.any(array):
         # Initial-seg seeding resets the backend's interactions, so it must
         # precede replay of the three initial AND all additional lassos.
-        session.add_initial_seg_interaction(array.copy(), run_prediction=False)
+        session.add_initial_seg_interaction(array, run_prediction=False)
+    from .volume_geometry import submit_lasso
+
     for index, prompt in enumerate(prompts):
-        session.add_lasso_interaction(prompt.crop, True, run_prediction=index == len(prompts) - 1,
-                                      interaction_bbox=prompt.bbox)
+        submit_lasso(session, prompt, index == len(prompts) - 1)
     return target, snapshot

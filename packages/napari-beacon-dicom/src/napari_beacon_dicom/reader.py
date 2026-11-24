@@ -238,6 +238,8 @@ def read_dicom_series_image(series: DicomSeries) -> sitk.Image:
         raise ValueError(
             f"Only 3D DICOM image series are supported, got {image.GetDimension()}D"
         )
+    if series.modality:
+        image.SetMetaData("0008|0060", series.modality)
     return image
 
 

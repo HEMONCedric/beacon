@@ -14,7 +14,6 @@ from napari.layers.base._base_constants import ActionType
 from napari.qt.threading import create_worker
 from napari.utils.colormaps import DirectLabelColormap
 from napari.utils.notifications import show_error, show_warning
-from napari_beacon_dicom.volume_reader import SEGMENTATION_MARKER
 from napari_nninteractive.widget_main import _SESSION_LOST_ERRORS
 from qtpy.QtCore import QTimer, Signal
 from qtpy.QtWidgets import (
@@ -23,7 +22,7 @@ from qtpy.QtWidgets import (
 )
 
 from .volume_geometry import (
-    LassoPrompt, PreparedVolume, predict_three_lassos, prepare_layer, prepare_path,
+    LassoPrompt, PreparedVolume, predict_three_lassos, prepare_layer, prepare_path, write_segmentation,
 )
 from .widget_nninteractive import nnInteractiveWidgetBeacon
 from .native_upload import upload_prepared
@@ -37,6 +36,7 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
     """Classic's local/remote backend with a constrained three-plane workflow."""
 
     upload_phase = Signal(str)
+    _background_classic_prompts = False
 
     def __init__(self, napari_viewer, **kwargs: Any):
         self._prepared: PreparedVolume | None = None
@@ -172,13 +172,13 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
         image_group = self._group(self.image_selection)
         workflow_layout = image_group.parentWidget().layout()
         model_group = self._group(self.mode_switch)
-        model_group.setTitle("Local / Remote")
+        model_group.setTitle("Model and inference")
         workflow_layout.insertWidget(1, group)
 
     def _update_workflow(self) -> None:
         if not self._ui_ready:
             return
-        busy = self._task_worker is not None or self._initializing or self._connecting
+        busy = self._task_worker is not None or self._initializing or self._connecting or self._beacon_worker is not None
         drawing = (self._session_ready and (not self._generated or self._adding_lasso)
                    and not self._manual_refinement_active and not busy)
         for axis, button in enumerate(self.plane_buttons):
@@ -211,6 +211,7 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
             self.ssh_target_edit, self.connect_btn, self.model_selection,
             self.model_selection_local, self.propagate_ckbx,
             self.use_torch_compile_ckbx, self.interactions_storage_combo,
+            self.engine_combo, self.oncorep_options,
         ):
             widget.setEnabled(not busy)
         self.progress.setVisible(busy)
@@ -305,6 +306,9 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
             self._original_visible = bool(self._original_layer.visible)
             self._original_layer.visible = False
         self._prepared = volume
+        if self._oncorep_session():
+            self.session = None
+            self._oncorep_export_reference = None
         self._plane_names = volume.plane_names
         self._session_ready = False
         self._generated = False
@@ -408,6 +412,16 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
         # Classic's hidden layer selector is populated by napari on every image
         # insertion. Only the two explicit image-selection actions may reset us.
         pass
+
+    def _prepared_for_oncorep(self):
+        return self._prepared
+
+    def _backend_busy_changed(self):
+        self._update_workflow()
+
+    def _backend_init_failed(self):
+        self._initializing = False
+        super()._backend_init_failed()
 
     def on_init(self, *args, **kwargs):
         if self._prepared is None or self._task_worker is not None:
@@ -760,6 +774,11 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
             "Segmentation ready. Add Lasso, Dilate, Refine Manually, or Undo."
             if np.any(mask) else "The predicted mask is empty. Undo to adjust the lassos."
         )
+        if self._oncorep_session():
+            report = (f"OncoRep · inference {self.session.last_prediction_s:.2f} s · "
+                      f"mask projection {self.session.last_projection_s:.2f} s")
+            self._show_backend_phase(report)
+            logging.getLogger(__name__).info(report)
 
     def on_undo(self, *_args, **_kwargs):
         if self._task_worker is not None or self._initializing or self._connecting:
@@ -821,10 +840,7 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
     @staticmethod
     def _write_mask(volume: PreparedVolume, mask: np.ndarray, path: str) -> str:
         exported = volume.mask_in_original_space(mask)
-        exported.SetMetaData("descrip", SEGMENTATION_MARKER)
-        exported.SetMetaData("ITK_FileNotes", SEGMENTATION_MARKER)
-        exported.SetMetaData("beacon_segmentation", "1")
-        sitk.WriteImage(exported, path, True)
+        write_segmentation(exported, path)
         return str(Path(path))
 
     def _clear_layers(self) -> None:

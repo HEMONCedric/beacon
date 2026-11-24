@@ -1,9 +1,23 @@
-# napari-nninteractive-beacon
+# BEACON
 
 BEACON wrapper around `napari-nninteractive==2.5.3` adding a one-way final manual-refinement phase before **Next Object**.
 
-The package contributes two widgets: **nnInteractive (BEACON Classic)** and
-**nnInteractive (BEACON 3-plane Lasso)**.
+Open **Plugins → BEACON** and choose **BEACON Classic** or **BEACON 3 Lasso**.
+Select **nnInteractive** or **IMPACT-OncoRep** under **Settings → Model**.
+Both run locally. nnInteractive also supports the existing remote server and
+SSH forwarding. See the [installation commands](../../README.md#local-installation).
+
+OncoRep applies its released body crop, resampling (1.5 × 1.5 × 2 mm in xyz),
+and modality-specific normalization to the native image. The same image is
+preprocessed once per initialization. The model reuses the encoded patch for
+corrections within that patch. **Auto** uses available DICOM modality metadata
+or recognizes typical CT in HU. For a scan with ambiguous metadata, select
+**CT**, **MR** or **PET (SUV)**. Classic uses positive and negative points and
+scribbles, positive boxes and lassos, and a previous mask as a refinement seed.
+
+Classic exports 3D object, instance and semantic masks as NIfTI on the source
+image grid. The 3 Lasso export includes the displayed mask with any manual edits
+and dilation.
 
 ## Three-plane lasso workflow
 
@@ -29,7 +43,9 @@ The package contributes two widgets: **nnInteractive (BEACON Classic)** and
    in the other planes. Display does not expand the masks into neighbouring
    slices; inference receives the original masks with unchanged footprints.
 5. Click **Generate segmentation**. All three cropped 2D masks are accumulated
-   before the single prediction. The controls are locked while it runs.
+   before one prediction. OncoRep receives the triplet on its own model planes.
+   For oblique acquisitions, each outline is projected onto the closest
+   corresponding model plane. The model runs in a worker thread.
 6. After prediction, choose **Add Lasso**, **Dilate**, **Refine Manually** or
    export. **Add Lasso** enables the plane buttons: choose any plane and slice,
    then draw another positive lasso. Prediction runs automatically when drawing
