@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from importlib.util import find_spec
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -66,6 +67,13 @@ class OncoRepTests(unittest.TestCase):
             self.assertIsNotNone(session.engine.lasso)
             self.assertEqual(session.engine.extra_lassos, [])
             self.assertTrue(mask[center])
+            previous = mask.copy()
+            initial = np.zeros_like(mask)
+            initial[center] = 1
+            session.add_initial_seg_interaction(initial)
+            self.assertTrue(session.undo())
+            np.testing.assert_array_equal(mask, previous)
+
             extra = LassoPrompt(0, lassos[0].crop, [[13, 14], *lassos[0].bbox[1:]])
             refined, snapshot = refine_with_lassos(session, mask, [*lassos, extra], 0)
             self.assertEqual(session.network.encodes, 1)
@@ -88,6 +96,52 @@ class OncoRepTests(unittest.TestCase):
         self.assertEqual(resolve_modality("PET", "MR", image), "PET")
         with self.assertRaisesRegex(ValueError, "modality"):
             resolve_modality("Auto", None, image)
+
+    def test_undo_import_preserves_exact_viewer_voxels_and_queued_prompts(self):
+        from napari_nninteractive_beacon.oncorep_session import LassoSession, OncoRepSession
+
+        session = OncoRepSession.__new__(OncoRepSession)
+        session.engine = LassoSession(
+            SimpleNamespace(shape=(4, 4, 4)), SimpleNamespace(prompt_channels=8), device="cpu",
+        )
+        session.shape = (7, 7, 7)
+        session.display_to_grid = np.diag([.5, .5, .5, 1.])
+        session.grid_to_display = np.linalg.inv(session.display_to_grid)
+        session.target = np.zeros(session.shape, dtype=np.uint8)
+        session.accepted, session.pending = [], []
+        session.last_undo = None
+        session._initial_mask = None
+
+        original = np.zeros_like(session.target)
+        original[3, 3, 3] = 1
+        session.add_initial_seg_interaction(original)
+        native_before = session.engine.mask.copy()
+        session.add_point_interaction((2, 2, 2), True, run_prediction=False)
+
+        replacement = np.zeros_like(session.target)
+        replacement[4:6, 4:6, 4:6] = 1
+        session.add_initial_seg_interaction(replacement)
+        session.add_point_interaction((4, 4, 4), True, run_prediction=False)
+
+        self.assertTrue(session.undo())
+        np.testing.assert_array_equal(session.target, replacement)
+        self.assertTrue(session.undo())
+        np.testing.assert_array_equal(session.target, original)
+        np.testing.assert_array_equal(session.engine.mask, native_before)
+        self.assertEqual(len(session.pending), 1)
+        np.testing.assert_array_equal(session.pending[0][1][0], (1, 1, 1))
+
+        # Run can consume a prompt queued before the replacement. Undo still
+        # corresponds to the import marker and restores the queued prompt.
+        session.add_initial_seg_interaction(replacement)
+        prediction = SimpleNamespace(mask=session.engine.mask.copy(), corner=(0, 0, 0))
+        with patch.object(session.engine, "predict", return_value=prediction):
+            session._predict()
+        self.assertTrue(session.undo())
+        np.testing.assert_array_equal(session.target, original)
+        self.assertEqual(len(session.pending), 1)
+        self.assertTrue(session.undo())
+        self.assertEqual(session.pending, [])
 
 
 class ClassicExportTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 """Adapter between BEACON's voxel grids and the released OncoRep interactive API."""
 
+from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -21,6 +22,15 @@ from .native_grid import grid_metadata
 REVERSE = np.eye(4)[[2, 1, 0, 3]]
 LPS_TO_RAS = np.diag([-1., -1., 1., 1.])
 MAX_BLOCK_VOXELS = 128 * 256 * 256
+
+
+@dataclass(frozen=True)
+class UndoState:
+    model_mask: MaskSnapshot | None
+    initial_mask: tuple[np.ndarray, MaskSnapshot] | None
+    accepted: list
+    pending: list
+    pending_count: int
 
 
 def image_affine(grid):
@@ -160,6 +170,7 @@ class OncoRepSession:
         self.lasso_axes = dict(zip(*linear_sum_assignment(-normals)))
         self.accepted, self.pending = [], []
         self.last_undo = None
+        self._initial_mask = None
         self.last_prediction_s = self.last_projection_s = 0.
         self.preprocess_s = perf_counter() - started
 
@@ -280,12 +291,43 @@ class OncoRepSession:
         region = tuple(slice(a - c, b - c) for a, b, c in zip(lo, hi, corner))
         return output_region(mask[region], lo, self.display_to_grid, self.shape)
 
+    def _snapshot(self, pending, pending_count=0):
+        native = self.engine.mask
+        return UndoState(
+            MaskSnapshot.capture(native, 0) if native.any() else None,
+            self._initial_mask,
+            self.accepted.copy(), list(pending), pending_count,
+        )
+
+    def _restore_snapshot(self, state):
+        self.accepted, self.pending = state.accepted, state.pending
+        self.engine.mask.fill(False)
+        if state.model_mask is not None:
+            np.copyto(self.engine.mask, state.model_mask.restore())
+        self.target.fill(0)
+        self._initial_mask = state.initial_mask
+        if self._initial_mask is not None:
+            # Some input contours lose voxels when projected to the model grid.
+            start, snapshot = self._initial_mask
+            section = tuple(slice(a, a + n) for a, n in zip(start, snapshot.shape))
+            self.target[section] = snapshot.restore()
+        elif state.model_mask is not None:
+            cropped, start = foreground_crop(self.engine.mask)
+            section, mask = output_region(cropped, start, self.display_to_grid, self.shape)
+            self.target[section] = mask
+        self._apply(self.accepted)
+
     def _predict(self):
         if not self.pending:
             return None
         started = perf_counter()
         engine = self.engine
-        before = MaskSnapshot.capture(engine.mask, 0) if engine.mask.any() else None
+        before = self._snapshot(self.pending[:-1])
+        undo = before
+        if self.last_undo is not None and self.last_undo.pending_count == len(self.pending):
+            # Running prompts already queued before an import belongs to the
+            # import action. The latest marker in Classic is still that import.
+            undo = replace(self.last_undo, pending_count=0)
         saved = engine.corner, engine.size, engine._skips, engine.last
         try:
             self._apply(self.accepted + self.pending)
@@ -293,13 +335,16 @@ class OncoRepSession:
             projected_at = perf_counter()
             section, mask = self._mask_projection(prediction.mask, prediction.corner)
         except Exception:
-            engine.mask = before.restore().copy() if before is not None else np.zeros(engine.volume.shape, bool)
+            engine.mask.fill(False)
+            if before.model_mask is not None:
+                np.copyto(engine.mask, before.model_mask.restore())
             engine.corner, engine.size, engine._skips, engine.last = saved
             self._apply(self.accepted)
             raise
         self.target.fill(0)
         self.target[section] = mask
-        self.last_undo = before, list(self.accepted), list(self.pending[:-1])
+        self._initial_mask = None
+        self.last_undo = undo
         self.accepted.extend(self.pending)
         self.pending.clear()
         self.last_prediction_s = projected_at - started
@@ -311,33 +356,37 @@ class OncoRepSession:
             raise ValueError("The initial mask must be on the selected image grid.")
         cropped = foreground_crop(mask)
         projected = np.zeros(self.engine.volume.shape, bool)
+        initial_mask = None
         if cropped is not None:
+            data, start = cropped
+            data = data.astype(bool, copy=False)
             region, binary = output_region(
-                cropped[0].astype(bool), cropped[1], self.grid_to_display, self.engine.volume.shape,
+                data, start, self.grid_to_display, self.engine.volume.shape,
             )
             projected[region] = binary
+            initial_mask = start, MaskSnapshot.capture(data, 0)
+        previous_undo = self.last_undo
+        undo = self._snapshot(self.pending, pending_count=len(self.pending))
         self.engine.set_mask(projected)
         np.not_equal(mask, 0, out=self.target)
-        self.last_undo = None
+        self._initial_mask = initial_mask
+        self.last_undo = undo
         if run_prediction and self.pending:
-            self._predict()
+            try:
+                self._predict()
+            except Exception:
+                self._restore_snapshot(undo)
+                self.last_undo = previous_undo
+                raise
 
     def undo(self):
-        if self.pending:
+        if self.pending and (self.last_undo is None or len(self.pending) > self.last_undo.pending_count):
             self.pending.pop()
             return True
         if self.last_undo is None:
             return False
-        snapshot, self.accepted, self.pending = self.last_undo
+        self._restore_snapshot(self.last_undo)
         self.last_undo = None
-        self.target.fill(0)
-        self.engine.mask.fill(False)
-        if snapshot is not None:
-            self.engine.mask = snapshot.restore().copy()
-            cropped, start = foreground_crop(self.engine.mask)
-            section, mask = output_region(cropped, start, self.display_to_grid, self.shape)
-            self.target[section] = mask
-        self._apply(self.accepted)
         return True
 
     def reset_interactions(self):
@@ -345,6 +394,7 @@ class OncoRepSession:
         self.accepted.clear()
         self.pending.clear()
         self.last_undo = None
+        self._initial_mask = None
         self.target.fill(0)
 
     def reset_for_refinement(self):

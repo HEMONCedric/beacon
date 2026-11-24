@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import os
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from napari_nninteractive_beacon.ssh_tunnel import (
+    SSH_TARGET_SETTING,
     TunnelError,
     TunnelManager,
     spec_from_url,
@@ -81,6 +85,54 @@ class WidgetTunnelTests(unittest.TestCase):
         widget = MagicMock()
         nnInteractiveWidgetMinimal._apply_inference_config(widget, {"ssh_target": "gpu-cluster"})
         widget.ssh_target_edit.setText.assert_called_once_with("gpu-cluster")
+
+    def test_oncorep_keeps_nninteractive_remote_preferences_across_docks(self):
+        from napari.components import ViewerModel
+        from napari_nninteractive_beacon.widget_nninteractive import nnInteractiveWidgetBeacon
+        from napari_nninteractive_beacon.widget_triplanar import nnInteractiveWidgetTriplanar
+        from qtpy.QtCore import QSettings
+        from qtpy.QtWidgets import QApplication
+
+        self.app = QApplication.instance() or QApplication([])
+        with TemporaryDirectory() as folder:
+            settings = QSettings(str(Path(folder) / "beacon.ini"), QSettings.Format.IniFormat)
+            settings.setValue("inference_mode", "remote")
+            settings.setValue("server_url", "http://127.0.0.1:1528")
+            settings.setValue(SSH_TARGET_SETTING, "user@gpu-server")
+            with (
+                patch("napari_nninteractive.widget_gui.QSettings", return_value=settings),
+                patch("napari_nninteractive.widget_gui.VersionChecker.start"),
+                patch.dict("os.environ"),
+            ):
+                os.environ.pop("ONCOREP_INTERACTIVE_WEIGHTS", None)
+                classic = nnInteractiveWidgetBeacon(ViewerModel())
+                self.assertTrue(classic._remote_mode)
+                session = MagicMock()
+                classic.session = session
+                classic._remote_connected = True
+
+                classic.engine_combo.setCurrentIndex(1)
+                self.assertFalse(classic._remote_mode)
+                self.assertFalse(classic.mode_switch.buttons[1].isEnabled())
+                self.assertEqual(settings.value("inference_mode"), "remote")
+                session.close.assert_called_once_with()
+                classic.oncorep_weights.setText("interactive-test.pt")
+                classic.oncorep_weights.editingFinished.emit()
+
+                # A second dock restores the chosen model and separate path.
+                triplanar = nnInteractiveWidgetTriplanar(ViewerModel())
+                self.assertTrue(triplanar._oncorep_selected())
+                self.assertEqual(triplanar.oncorep_weights.text(), "interactive-test.pt")
+                triplanar.engine_combo.setCurrentIndex(0)
+                self.assertTrue(triplanar._remote_mode)
+                self.assertEqual(triplanar.mode_switch.index, 1)
+                self.assertEqual(triplanar.server_url_edit.text(), "http://127.0.0.1:1528")
+                self.assertEqual(triplanar.ssh_target_edit.text(), "user@gpu-server")
+                classic.engine_combo.setCurrentIndex(0)
+                self.assertTrue(classic._remote_mode)
+                self.assertEqual(classic.server_url_edit.text(), "http://127.0.0.1:1528")
+                classic.close()
+                triplanar.close()
 
 
 if __name__ == "__main__":

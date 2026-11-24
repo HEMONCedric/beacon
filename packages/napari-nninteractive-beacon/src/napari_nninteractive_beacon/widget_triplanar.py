@@ -179,7 +179,9 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
         if not self._ui_ready:
             return
         busy = self._task_worker is not None or self._initializing or self._connecting or self._beacon_worker is not None
-        drawing = (self._session_ready and (not self._generated or self._adding_lasso)
+        working = self._working_image_is_current()
+        result = self._result_layer()
+        drawing = (working and self._session_ready and (not self._generated or self._adding_lasso)
                    and not self._manual_refinement_active and not busy)
         for axis, button in enumerate(self.plane_buttons):
             button.setEnabled(drawing)
@@ -193,19 +195,23 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
             self.lasso_status.setText(self.lasso_status.text() + f"; +{len(self._extra_prompts)} additional")
         for widget in (self.path_edit, self.browse_button, self.active_image_button):
             widget.setEnabled(not busy)
-        self.init_button.setEnabled(self._prepared is not None and not busy)
+        self.init_button.setEnabled(working and not busy)
         self.generate_button.setEnabled(drawing and not self._generated and len(self._prompts) == 3)
         self.add_lasso_button.setEnabled(
-            self._generated and self._session_ready and not self._manual_refinement_active and not busy
+            working and result is not None and self._generated and self._session_ready
+            and not self._manual_refinement_active and not busy
             and bool(getattr(self.session, "supports_initial_label", False))
         )
         self.add_lasso_button.setChecked(self._adding_lasso)
-        self.dilate_button.setEnabled(self._generated and not self._adding_lasso and not busy)
-        self.undo_button.setEnabled(not busy and (self._generated or bool(self._prompts)))
-        self.refine_manual_button.setEnabled(
-            self._generated and not self._manual_refinement_active and not self._adding_lasso and not busy
+        self.dilate_button.setEnabled(
+            working and result is not None and self._generated and not self._adding_lasso and not busy
         )
-        self.export_button.setEnabled(self._generated and not self._adding_lasso and not busy)
+        self.undo_button.setEnabled(not busy and (result is not None if self._generated else bool(self._prompts)))
+        self.refine_manual_button.setEnabled(
+            result is not None and self._generated and not self._manual_refinement_active and not self._adding_lasso
+            and not busy
+        )
+        self.export_button.setEnabled(result is not None and self._generated and not self._adding_lasso and not busy)
         for widget in (
             self.mode_switch, self.server_url_edit, self.api_key_edit,
             self.ssh_target_edit, self.connect_btn, self.model_selection,
@@ -215,22 +221,56 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
         ):
             widget.setEnabled(not busy)
         self.progress.setVisible(busy)
-        result = self._result_layer()
         if result is not None:
             result.editable = self._manual_refinement_active and not busy
         if self.lasso_layer_name in self._viewer.layers:
             self._viewer.layers[self.lasso_layer_name].editable = drawing
 
-    def _start_task(self, function, *args, message: str, returned) -> None:
+    def _working_image_is_current(self):
+        layer = self._working_layer
+        return (
+            self._prepared is not None and layer in self._viewer.layers
+            and layer.data is self._prepared.data
+            and np.allclose(layer._data_to_world.affine_matrix, self._prepared.display_matrix_zyx)
+        )
+
+    def _start_task(self, function, *args, message: str, returned, image=None, updates_mask=False) -> None:
         if self._task_worker is not None:
             return
+        layers = self._viewer.layers
+        session = self.session
+        required = ()
+        if updates_mask:
+            image = self._working_layer
+            lasso = layers[self.lasso_layer_name] if self.lasso_layer_name in layers else None
+            overlays = (self._result_layer(), self._prompt_layer, lasso)
+            if not self._working_image_is_current() or any(layer is None or layer not in layers for layer in overlays):
+                self._backend_image_changed()
+                return
+            required = tuple((layer.name, layer) for layer in overlays)
+        image_is_current = self._watch_image(image)
+
+        def current():
+            return (
+                image_is_current() and session is self.session
+                and all(layer in layers and layer.name == name for name, layer in required)
+            )
+
+        def discard():
+            if updates_mask:
+                self._adding_lasso = False
+                if not self._working_image_is_current():
+                    self._workflow_active = False
+                    self._unlock_session()
+            self.task_status.setText("The image or segmentation changed during the operation. Result ignored.")
+
         self.task_status.setText(message)
         worker = create_worker(
             function, *args, _start_thread=False, _ignore_errors=True,
         )
         self._task_worker = worker
-        worker.returned.connect(returned)
-        worker.errored.connect(self._task_error)
+        worker.returned.connect(lambda result: returned(result) if current() else discard())
+        worker.errored.connect(lambda error: self._task_error(error) if current() else discard())
         worker.finished.connect(self._task_finished)
         self._update_workflow()
         worker.start()
@@ -295,6 +335,7 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
             dict(layer.metadata), layer.name, layer.source.path,
             message="Resampling to 1 mm…",
             returned=self._on_prepared,
+            image=layer,
         )
 
     def _on_prepared(self, volume: PreparedVolume) -> None:
@@ -326,6 +367,7 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
                 **transform, interpolation2d="spline36",
                 metadata={"beacon_triplanar_working": True},
             )
+            self._bind_layer_undo(self._working_layer)
         else:
             self._working_layer.data = volume.data
             self._apply_display_geometry(self._working_layer)
@@ -423,8 +465,14 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
         self._initializing = False
         super()._backend_init_failed()
 
+    def _backend_image_changed(self):
+        self._backend_init_failed()
+        if not self._working_image_is_current():
+            self._workflow_active = False
+        self.task_status.setText("The selected image changed. Choose the image again.")
+
     def on_init(self, *args, **kwargs):
-        if self._prepared is None or self._task_worker is not None:
+        if not self._working_image_is_current() or self._task_worker is not None:
             return
         self.image_selection.blockSignals(True)
         self.image_selection.setCurrentText(self._working_layer.name)
@@ -538,7 +586,6 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
             # Native Paint/Erase works in every plane; the BEACON autofill
             # helper is axial-only and is not part of this workflow.
             self._viewer.layers[name].autofill = False
-            self._viewer.layers[name].bind_key("Control-Z", lambda layer: self.on_undo(), overwrite=True)
 
     def _set_interaction_button_support(self, supported: dict[int, bool]) -> None:
         super()._set_interaction_button_support(
@@ -572,6 +619,7 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
                 **self._prepared.layer_transform(),
             )
             self._prompt_layer.editable = False
+            self._bind_layer_undo(self._prompt_layer)
         self._refresh_prompt_masks()
 
     def _refresh_prompt_masks(self) -> None:
@@ -668,6 +716,7 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
                 [*self._prompts.values(), *self._extra_prompts, prompt], len(self._extra_prompts),
                 message="Refining with the additional lasso…",
                 returned=lambda edit: self._on_extra_lasso(edit, prompt),
+                updates_mask=True,
             )
             return
         self._prompts.pop(axis, None)
@@ -695,6 +744,7 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
             predict_three_lassos, self.session, list(self._prompts.values()),
             tuple(self._prepared.data.shape), message="Segmenting from the three masks…",
             returned=self._on_predicted,
+            updates_mask=True,
         )
 
     def _toggle_add_lasso(self, checked=False):
@@ -732,13 +782,15 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
         self._on_predicted(mask)
 
     def _dilate(self, *_args):
-        if (not self._generated or self._adding_lasso or self._task_worker is not None
+        layer = self._result_layer()
+        if (layer is None or not self._generated or self._adding_lasso or self._task_worker is not None
                 or self._initializing or self._connecting):
             return
         self._start_task(
-            dilate_with_snapshot, self._result_layer().data.copy(),
+            dilate_with_snapshot, layer.data.copy(),
             self._prepared.working.GetSpacing()[::-1], len(self._extra_prompts),
             message="Dilating by 2 mm…", returned=self._on_dilated,
+            updates_mask=True,
         )
 
     def _on_dilated(self, edit):
@@ -783,6 +835,8 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
     def on_undo(self, *_args, **_kwargs):
         if self._task_worker is not None or self._initializing or self._connecting:
             return
+        if self._generated and self._result_layer() is None:
+            return
         if self._adding_lasso:
             self._toggle_add_lasso(False)
             return
@@ -821,7 +875,8 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
         self._update_workflow()
 
     def _export(self) -> None:
-        if not self._generated or self._adding_lasso or self._task_worker is not None:
+        layer = self._result_layer()
+        if layer is None or not self._generated or self._adding_lasso or self._task_worker is not None:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export mask on the original grid", "segmentation.nii.gz",
@@ -832,7 +887,7 @@ class nnInteractiveWidgetTriplanar(nnInteractiveWidgetBeacon):
         if not any(path.lower().endswith(ext) for ext in (".nii", ".nii.gz", ".mha", ".nrrd")):
             path += ".nii.gz"
         self._start_task(
-            self._write_mask, self._prepared, self._result_layer().data.copy(), path,
+            self._write_mask, self._prepared, layer.data.copy(), path,
             message="Exporting on the original grid…",
             returned=lambda saved: self.task_status.setText(f"Exported: {saved}"),
         )

@@ -5,18 +5,20 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+from weakref import WeakSet
 
 import numpy as np
 import SimpleITK as sitk
+from app_model.types import KeyCode, KeyMod
 from napari.layers.labels._labels_constants import Mode
 from napari.qt.threading import create_worker
 from napari.utils.notifications import show_info, show_warning
 from napari_beacon_layers import ManualLabelsLayer
 from napari_nninteractive import nnInteractiveWidget
-from qtpy.QtCore import Signal
+from qtpy.QtCore import QSignalBlocker, Signal
 from qtpy.QtWidgets import (
     QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QProgressBar, QPushButton, QWidget,
+    QProgressBar, QPushButton, QShortcut, QWidget,
 )
 
 from .native_grid import grid_metadata
@@ -27,6 +29,9 @@ from .volume_geometry import (
 
 
 LOGGER = logging.getLogger(__name__)
+ENGINE_SETTING = "beacon/interactive_engine"
+ONCOREP_CHECKPOINT_SETTING = "beacon/oncorep/checkpoint"
+UNDO_KEY = KeyMod.CtrlCmd | KeyCode.KeyZ
 
 
 def initialize_nninteractive(checkpoint_text, model_id, compile_model, autozoom, storage):
@@ -120,6 +125,8 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         self._saved_prompt_modes: dict[str, Any] = {}
         self._ssh_tunnel_worker = None
         self._beacon_worker = None
+        self._image_changed_during_worker = False
+        self._undo_layers = WeakSet()
         self._oncorep_export_reference = None
         self._active_oncorep_options = None
         self._classic_nninteractive_target = None
@@ -143,6 +150,10 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         self.refine_manual_button.setEnabled(self.session is not None)
         self._nninteractive_autorefine_tooltip = self.auto_refine.toolTip()
         self.backend_progress.connect(self._show_backend_phase)
+        if self._supports_oncorep:
+            for shortcut in self.undo_button.findChildren(QShortcut):
+                shortcut.setEnabled(False)
+            self._show_engine_settings()
 
     def _init_model_selection(self) -> QGroupBox:
         if self._supports_oncorep and self._local_available:
@@ -171,13 +182,15 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
             self.engine_combo = QComboBox()
             self.engine_combo.addItem("nnInteractive", "nninteractive")
             self.engine_combo.addItem("IMPACT-OncoRep", "oncorep")
+            saved_engine = self._settings.value(ENGINE_SETTING, "nninteractive", type=str)
+            self.engine_combo.setCurrentIndex(max(0, self.engine_combo.findData(saved_engine)))
             engines = QFormLayout()
             engines.addRow("Model", self.engine_combo)
             group.layout().insertLayout(0, engines)
             self.oncorep_options = QWidget()
             options = QFormLayout(self.oncorep_options)
             options.setContentsMargins(0, 0, 0, 0)
-            self.oncorep_weights = QLineEdit(os.environ.get("ONCOREP_INTERACTIVE_WEIGHTS", ""))
+            self.oncorep_weights = QLineEdit(self._saved_oncorep_checkpoint())
             self.oncorep_weights.setPlaceholderText("Released interactive.pt")
             self.oncorep_weights.setToolTip("Use the Hub release, or enter a local interactive.pt file.")
             self.oncorep_modality = QComboBox()
@@ -189,14 +202,9 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
             self.oncorep_options.hide()
             self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
             self.oncorep_modality.currentIndexChanged.connect(self._on_oncorep_settings_changed)
-            self.oncorep_weights.editingFinished.connect(self._on_oncorep_settings_changed)
+            self.oncorep_weights.editingFinished.connect(self._save_oncorep_checkpoint)
 
-        saved = self._settings.value(
-            SSH_TARGET_SETTING,
-            self._settings.value("beacon/nninteractive_ssh_target", "", type=str),
-            type=str,
-        )
-        self.ssh_target_edit = QLineEdit(saved)
+        self.ssh_target_edit = QLineEdit(self._saved_ssh_target())
         self.ssh_target_edit.setPlaceholderText("user@host or SSH alias (optional for a local server)")
         self.ssh_target_edit.setToolTip(
             "For a localhost URL, open an SSH tunnel automatically before Connect or Initialize. "
@@ -238,20 +246,50 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
     def _oncorep_selected(self):
         return self._supports_oncorep and self.engine_combo.currentData() == "oncorep"
 
-    def _on_engine_changed(self):
+    def _saved_ssh_target(self):
+        return self._settings.value(
+            SSH_TARGET_SETTING,
+            self._settings.value("beacon/nninteractive_ssh_target", "", type=str),
+            type=str,
+        )
+
+    def _saved_oncorep_checkpoint(self):
+        saved = self._settings.value(ONCOREP_CHECKPOINT_SETTING, "", type=str)
+        return os.environ.get("ONCOREP_INTERACTIVE_WEIGHTS", saved)
+
+    def _show_engine_settings(self):
         oncorep = self._oncorep_selected()
-        if oncorep and self._remote_mode:
-            self.mode_switch._uncheck()
-            self.mode_switch._check(0)
-            self.on_mode_switched()
-        else:
-            self.on_model_selected()
+        # Upstream inference_mode and server_url describe nnInteractive only.
+        self._remote_mode = not oncorep and self._restore_remote_mode()
+        self.mode_switch._uncheck()
+        self.mode_switch._check(int(self._remote_mode))
+        if not oncorep and not self._local_available:
+            self._grey_local_switch_button()
         self.mode_switch.buttons[1].setEnabled(not oncorep)
         self.local_container.setVisible(not self._remote_mode and not oncorep)
         self.remote_container.setVisible(self._remote_mode and not oncorep)
         self.oncorep_options.setVisible(oncorep)
+        self._update_init_button_text(initialized=self._session_locked)
+
+    def _on_engine_changed(self):
+        if self._remote_connected:
+            self._disconnect_remote()
+        self._settings.setValue(ENGINE_SETTING, self.engine_combo.currentData())
+        # The other BEACON dock may have updated the shared preferences.
+        with QSignalBlocker(self.server_url_edit), QSignalBlocker(self.ssh_target_edit):
+            url = self._settings.value("server_url", "", type=str).strip()
+            self.server_url_edit.setText(url or DEFAULT_SERVER_URL)
+            self.ssh_target_edit.setText(self._saved_ssh_target())
+        if self._oncorep_selected():
+            self.oncorep_weights.setText(self._saved_oncorep_checkpoint())
+        self._show_engine_settings()
+        self.on_model_selected()
         self.auto_refine.setToolTip(self._nninteractive_autorefine_tooltip)
         self.backend_status.hide()
+
+    def _save_oncorep_checkpoint(self):
+        self._settings.setValue(ONCOREP_CHECKPOINT_SETTING, self.oncorep_weights.text().strip())
+        self._on_oncorep_settings_changed()
 
     def _on_oncorep_settings_changed(self):
         if self._oncorep_selected() and self.session is not None and self._beacon_worker is None:
@@ -270,9 +308,38 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         self.backend_status.setText(message)
         self.backend_status.show()
 
+    def _watch_image(self, layer):
+        if layer is None:
+            return lambda: True
+        name, data = layer.name, layer.data
+        transform = layer._data_to_world.affine_matrix.copy()
+        return lambda: (
+            layer in self._viewer.layers and layer.name == name and layer.data is data
+            and np.array_equal(layer._data_to_world.affine_matrix, transform)
+        )
+
+    def on_image_selected(self):
+        if self._beacon_worker is not None:
+            # Removing or renaming a viewer layer can change the combo box
+            # even while it is disabled. Keep the session alive until Qt
+            # receives the worker's terminal signal.
+            self._image_changed_during_worker = True
+            return
+        return super().on_image_selected()
+
+    def _backend_image_changed(self):
+        self.on_image_selected()
+        self._show_backend_phase("The selected image changed. Initialize again.")
+
     def _run_backend_worker(self, function, args, message, done, failed=None):
         if self._beacon_worker is not None:
             return
+        self._image_changed_during_worker = False
+        layers = self._viewer.layers
+        name = self.image_selection.currentText()
+        image_is_current = self._watch_image(layers[name] if name in layers else None)
+        result_layer = layers[self.label_layer_name] if self.label_layer_name in layers else None
+        session = self.session
         widgets = [
             self.init_button, self.reset_button, self.image_selection, self.mode_switch,
             self.local_container, self.remote_container, self.propagate_ckbx,
@@ -298,23 +365,34 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         self._beacon_worker = worker
         self._backend_busy_changed()
 
-        def restore():
+        def finish():
+            same_session = session is self.session
+            valid = (
+                same_session and not self._image_changed_during_worker and image_is_current()
+                and (result_layer is None or result_layer in layers)
+            )
             self._beacon_worker = None
+            self._image_changed_during_worker = False
             self.backend_spinner.hide()
             for widget, enabled in states:
                 widget.setEnabled(enabled)
-            for layer, mode in prompts:
-                if layer in self._viewer.layers:
-                    layer.editable = True
-                    layer.mode = mode
+            if valid:
+                for layer, mode in prompts:
+                    if layer in layers:
+                        layer.editable = True
+                        layer.mode = mode
+            elif same_session:
+                self._backend_image_changed()
             self._backend_busy_changed()
+            return valid
 
         def succeeded(result):
-            restore()
-            done(result)
+            if finish():
+                done(result)
 
         def errored(error):
-            restore()
+            if not finish():
+                return
             self._show_backend_phase(str(error))
             show_warning(str(error))
             if failed is not None:
@@ -559,7 +637,35 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
         layer.editable = False
         layer.mode = Mode.PAN_ZOOM
         layer._source = self.session_cfg["source"]
+        self._bind_layer_undo(layer)
         self._viewer.add_layer(layer)
+
+    def _bind_layer_undo(self, layer):
+        if self._supports_oncorep:
+            layer.bind_key(UNDO_KEY, self._undo_from_layer, overwrite=True)
+            self._undo_layers.add(layer)
+
+    def _undo_from_layer(self, layer):
+        if self._viewer.layers.selection.active is not layer or self._beacon_worker is not None:
+            return
+        if self._manual_refinement_active and layer.name == self.label_layer_name:
+            if layer.editable:
+                layer.undo()
+        elif self.undo_button.isEnabled():
+            self.on_undo()
+
+    def on_interaction_selected(self):
+        name = self.layer_dict.get(self.interaction_button.index)
+        new_layer = name is not None and name not in self._viewer.layers
+        super().on_interaction_selected()
+        if new_layer and name in self._viewer.layers:
+            self._bind_layer_undo(self._viewer.layers[name])
+
+    def closeEvent(self, event):  # noqa: N802
+        for layer in self._undo_layers:
+            layer.bind_key(UNDO_KEY, None, overwrite=True)
+        self._undo_layers.clear()
+        super().closeEvent(event)
 
     def on_refine_manually(self, *_args: Any) -> None:
         if self._manual_refinement_active:
@@ -740,6 +846,7 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
             show_warning("The initial mask must match the selected image grid.")
             return
         mask, label = labels.data, self.class_for_init.value()
+        session = self.session
         oncorep = self._oncorep_session()
         auto_refine = not oncorep and self.auto_refine.isChecked()
 
@@ -747,7 +854,7 @@ class nnInteractiveWidgetBeacon(nnInteractiveWidget):
             binary = mask == label
             if not binary.any():
                 raise ValueError("The selected label is empty.")
-            self.session.add_initial_seg_interaction(binary.astype(np.uint8), run_prediction=auto_refine)
+            session.add_initial_seg_interaction(binary.astype(np.uint8), run_prediction=auto_refine)
 
         def done(_result):
             self._interaction_history.append(None)

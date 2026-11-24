@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,11 +12,13 @@ import SimpleITK as sitk
 from napari.components import ViewerModel
 from napari_beacon_dicom.volume_reader import read_medical_volume
 from qtpy.QtCore import QEventLoop, QTimer
-from qtpy.QtWidgets import QApplication
+from napari.utils.key_bindings import KeymapHandler
+from qtpy.QtWidgets import QApplication, QShortcut
 
 from napari_nninteractive_beacon.volume_geometry import (
     LassoPrompt, image_from_layer, predict_three_lassos, prepare_layer, prepare_volume,
 )
+from napari_nninteractive_beacon.widget_nninteractive import UNDO_KEY, nnInteractiveWidgetBeacon
 from napari_nninteractive_beacon.widget_triplanar import nnInteractiveWidgetTriplanar
 
 
@@ -250,6 +253,97 @@ class WorkflowTests(unittest.TestCase):
         layer.add(np.array(vertices), shape_type="polygon")
         QApplication.processEvents()
         self.assertIn(axis, widget._prompts)
+
+    def test_classic_defers_reset_and_discards_result_if_source_is_removed(self):
+        viewer = ViewerModel()
+        image = viewer.add_image(np.zeros((3, 4, 5)), name="Source")
+        viewer.add_image(np.ones((3, 4, 5)), name="Next image")
+        widget = nnInteractiveWidgetBeacon(viewer)
+        self.addCleanup(widget.close)
+        session = MagicMock()
+        widget.session = session
+        release = Event()
+        returned = MagicMock()
+
+        def predict():
+            self.assertTrue(release.wait(5))
+            return "old prediction"
+
+        widget._run_backend_worker(predict, (), "Predicting", returned)
+        try:
+            self.assertFalse(widget.image_selection.isEnabled())
+            viewer.layers.remove(image)
+            self.assertEqual(widget.image_selection.currentText(), "Next image")
+            session.reset_interactions.assert_not_called()
+        finally:
+            release.set()
+            wait_worker(widget, "_beacon_worker")
+
+        session.reset_interactions.assert_called_once_with()
+        returned.assert_not_called()
+        self.assertTrue(widget.image_selection.isEnabled())
+        self.assertIn("image changed", widget.backend_status.text())
+
+    def test_three_lasso_discards_prediction_after_working_image_is_removed(self):
+        self.initialize(remote=False)
+        for axis in range(3):
+            self.draw(axis)
+        widget = self.widget
+        result = widget._result_layer()
+        release = Event()
+
+        def predict(*args):
+            self.assertTrue(release.wait(5))
+            return np.ones_like(result.data)
+
+        with patch("napari_nninteractive_beacon.widget_triplanar.predict_three_lassos", side_effect=predict):
+            widget._generate()
+            try:
+                self.viewer.layers.remove(widget._working_layer)
+            finally:
+                release.set()
+                wait_worker(widget, "_task_worker")
+
+        self.assertFalse(result.data.any())
+        self.assertFalse(widget._generated)
+        self.assertFalse(widget.init_button.isEnabled())
+        self.assertIn("Result ignored", widget.task_status.text())
+
+    def test_canvas_undo_follows_the_selected_layer_and_preserves_paint_undo(self):
+        self.initialize(remote=False)
+        self.draw(0)
+        classic = nnInteractiveWidgetBeacon(self.viewer)
+        self.addCleanup(classic.close)
+        classic.session_cfg = self.widget.session_cfg.copy()
+        classic.add_label_layer(np.zeros(self.volume.data.shape, dtype=np.uint8), classic.label_layer_name)
+        classic.undo_button.setEnabled(True)
+        classic_result = self.viewer.layers[classic.label_layer_name]
+        three_lasso = self.viewer.layers[self.widget.lasso_layer_name]
+        handler = KeymapHandler()
+
+        def press(layer):
+            self.viewer.layers.selection.active = layer
+            handler.keymap_providers = [layer, self.viewer]
+            self.assertTrue(handler.press_key(UNDO_KEY))
+
+        for dock in (classic, self.widget):
+            shortcuts = dock.undo_button.findChildren(QShortcut)
+            self.assertTrue(shortcuts)
+            self.assertTrue(all(not shortcut.isEnabled() for shortcut in shortcuts))
+
+        with patch.object(classic, "on_undo") as classic_undo, patch.object(self.widget, "on_undo") as three_undo:
+            press(three_lasso)
+            three_undo.assert_called_once_with()
+            classic_undo.assert_not_called()
+            press(classic_result)
+            classic_undo.assert_called_once_with()
+            classic._manual_refinement_active = True
+            classic_result.editable = True
+            with patch.object(classic_result, "undo") as paint_undo:
+                press(classic_result)
+                paint_undo.assert_called_once_with()
+            classic_undo.assert_called_once_with()
+            three_undo.assert_called_once_with()
 
     def test_mouse_drawing_finishes_before_plane_switch(self):
         from napari.layers.shapes._shapes_mouse_bindings import initiate_polygon_draw
